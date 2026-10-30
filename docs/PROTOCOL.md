@@ -43,8 +43,13 @@ change, including knob turns. It goes back to `0x2d` (about 18 %) at every power
   response is ignored.
 - The speaker never answers that write. It drops the connection instead, so a disconnect right
   after the write means it worked.
-- Writing `01 01` sets "auto-boot once": the speaker stays on, but the next power-off restarts it.
-  Following it with `00` is a remote reboot. This write also drops the connection.
+- Writing `01 01` sets "auto-boot once": the speaker stays on, but boots by itself the next time
+  it gets power. Following it with `00` is a remote reboot; cutting its power (a smart plug on the
+  charger) and restoring it later boots it too. The flag is used up by that boot, and survives the
+  power cut in between. The speaker never answers this write: a Go on firmware 2.4.3 keeps the
+  link and BlueZ gives up after about 30 s with ATT error `0x0e`, yet it took effect. The
+  integration waits 3 s, then closes the link.
+- Never write `01 02` ("always"): the knob then restarts the speaker instead of turning it off.
 - **The speaker can't be turned on over Bluetooth**: its radio is off along with it.
 
 ### Sound profile
@@ -55,8 +60,21 @@ sends back the bands unchanged, so the speaker keeps its stored custom EQ.
 
 ### Sound status
 
-The second byte is a bitfield of the inputs playing right now: 1 channel 1, 2 channel 2, 4 AUX,
-8 Bluetooth, 16 TeamUp.
+Six bytes, e.g. `00 04 00 02 00 08`. The second byte is a bitfield of the inputs playing right
+now: 1 channel 1, 2 channel 2, 4 AUX, 8 Bluetooth, 16 TeamUp. The speaker notifies it about once a
+second while connected, changed or not.
+
+Seen on a Go (firmware 2.4.3):
+
+- AUX counts as soon as a cable is plugged in, whether anything plays: detection is mechanical. It
+  takes priority over Bluetooth.
+- Bluetooth counts only while audio streams, not while a phone is merely connected.
+- After AUX is unplugged, the byte goes `04` → `0c` → `08` → `00` over 2–7 s, also with no phone
+  around. That's the amplifier winding down, so the integration only shows a value that held for
+  3 s.
+- Any non-zero value means the amplifier is on, and hisses faintly; volume 0 doesn't silence it.
+- The third byte becomes `01` once Bluetooth has played and stays so until AUX takes over. The
+  fourth and sixth bytes are unknown.
 
 ## PIN
 
@@ -67,11 +85,28 @@ The PIN is optional and has 4 digits; it is set from the SOUNDBOKS app.
    the link and the authentication with it.
 3. Write `aup` followed by the PIN's ASCII digits to serial TX, e.g. `aup1234` (write with
    response).
-4. The answer arrives on RX: `01 00 00 00 00` accepts the PIN, a packet starting with `02` refuses
-   it.
+4. The answer arrives on RX: `01 00 00 00 00` accepts the PIN. A packet starting with `02` refuses
+   it (what the firmware sends for errors); the SOUNDBOKS app treats one starting with `00` as a
+   refusal too, and so does the integration.
 
 Until a PIN is accepted, reads still work but every write fails with ATT error `0x81` and changes
 nothing. Authentication lasts until the connection closes.
+
+## Serial replies
+
+Other serial commands are three ASCII letters written to TX. Most answers start with a 5-byte
+header, `01` and the payload length as a 32-bit big-endian number, followed by the payload, split
+over as many notifications as it takes. `fwv`, `pmv`, `ski`, `gdi` and `tpg` answer with one bare
+packet instead. An error is the two bytes `02` and a code, e.g. `02 29`. Only the length tells it
+apart: a Go's `fwv` answer, `02 2e 04 2e 03`, starts with `02` too.
+
+## Advertisement
+
+The manufacturer data (company `0x0858`) starts with five bytes: a security bitfield (`01` PIN
+set, `02` locked as lost or stolen), the firmware's major, minor and patch numbers, and the product
+model (`1` SB3, `2` Go, `3` SB4; `0` on old SB3 units). A device ID and a SKAA ID follow. From
+firmware 3.0 the serial channel carries a different protocol (pw_rpc), so the integration doesn't
+connect to such a speaker.
 
 ## Advertising while connected
 

@@ -17,3 +17,12 @@ extend-select = ["I", "B", "UP", "ASYNC"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+
+[dependency-groups]
+# Same pins as requirements-dev.txt (which CI and dependabot use), so `uv run pytest` works too
+dev = [
+    "pytest-homeassistant-custom-component==0.13.374",
+    "aiousbwatcher==1.1.2",
+    "serialx==1.14.0",
+    "dbus-fast==5.2.0",
+]

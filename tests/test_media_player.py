@@ -173,4 +173,4 @@ async def test_turn_on_missing_entity_raises(hass: HomeAssistant, fake_speaker: 
     await setup_entry(hass, entry)
     with pytest.raises(HomeAssistantError) as raised:
         await call(hass, SERVICE_TURN_ON)
-    assert raised.value.translation_key == "turn_on_entity_missing"
+    assert raised.value.translation_key == "entity_missing"

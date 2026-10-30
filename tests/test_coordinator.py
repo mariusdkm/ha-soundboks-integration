@@ -1,7 +1,9 @@
 """Setup, polling and presence, against the fake speaker."""
 
+import asyncio
+from collections.abc import Iterator
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
@@ -14,9 +16,10 @@ from homeassistant.components.bluetooth import (
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
-from custom_components.soundboks.const import CONF_PIN, PRESENCE_GRACE
+from custom_components.soundboks.const import CONF_PIN, DOMAIN, PRESENCE_GRACE
 from custom_components.soundboks.protocol import FIRMWARE_UUID, POWER_UUID, VOLUME_UUID
 
 from .conftest import (
@@ -24,6 +27,7 @@ from .conftest import (
     FakeSpeaker,
     advertise,
     go_unavailable,
+    make_ble_device,
     make_service_info,
     setup_entry,
 )
@@ -51,6 +55,10 @@ async def test_advertisement_reads_state(
     assert coordinator.present is True
     assert coordinator.data.volume == 0x2D
     assert coordinator.firmware == "2.4.2"
+    device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, ADDRESS), mock_entry.entry_id
+    )
+    assert device is not None and device.sw_version == "2.4.2"
     assert coordinator.client.is_connected is False
 
 
@@ -356,3 +364,108 @@ async def test_advert_right_after_power_off_ignored(
     async_clear_advertisement_history(hass, ADDRESS)  # so the advert below is delivered
     await advertise(hass, mock_entry)
     assert coordinator.present is False
+
+
+@pytest.fixture
+def orphaned_link() -> Iterator[AsyncMock]:
+    """BlueZ holds a link to the speaker that HA never owned; the mock closes it."""
+    with (
+        patch(
+            "custom_components.soundboks.client.get_connected_devices",
+            AsyncMock(return_value=[make_ble_device()]),
+        ),
+        patch("custom_components.soundboks.client.close_stale_connections", AsyncMock()) as close,
+    ):
+        yield close
+
+
+async def test_command_closes_orphaned_link(
+    hass: HomeAssistant,
+    mock_entry: MockConfigEntry,
+    fake_speaker: FakeSpeaker,
+    orphaned_link: AsyncMock,
+):
+    """The orphan stops the adverts, so without closing it the speaker stays unreachable."""
+    await setup_entry(hass, mock_entry)
+    await advertise(hass, mock_entry)
+    with later(60):
+        await mock_entry.runtime_data.async_set_volume(10)
+    orphaned_link.assert_awaited()
+    assert (VOLUME_UUID, b"\x0a") in fake_speaker.writes
+    await mock_entry.runtime_data.client.disconnect()
+
+
+async def test_poll_closes_orphaned_link(
+    hass: HomeAssistant,
+    mock_entry: MockConfigEntry,
+    fake_speaker: FakeSpeaker,
+    orphaned_link: AsyncMock,
+):
+    await setup_entry(hass, mock_entry)
+    await advertise(hass, mock_entry)
+    coordinator = mock_entry.runtime_data
+    connects = fake_speaker.connect_count
+    fake_speaker.values[VOLUME_UUID] = bytes([99])
+    with later(60):
+        await coordinator.async_refresh()
+    orphaned_link.assert_awaited()
+    assert fake_speaker.connect_count == connects + 1
+    assert coordinator.data.volume == 99
+
+
+async def test_volume_burst_writes_only_first_and_latest(
+    hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
+):
+    """A dragged slider: calls waiting behind a write collapse into the latest one."""
+    await setup_entry(hass, mock_entry)
+    await advertise(hass, mock_entry)
+    coordinator = mock_entry.runtime_data
+    gate = asyncio.Event()
+    written: list[int] = []
+
+    async def slow_set_volume(raw: int) -> None:
+        written.append(raw)
+        await gate.wait()
+
+    with patch.object(coordinator.client, "set_volume", slow_set_volume):
+        calls = [
+            asyncio.create_task(coordinator.async_set_volume(raw)) for raw in range(10, 60, 10)
+        ]
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.gather(*calls)
+    assert written == [10, 50]
+    assert coordinator.data.volume == 50
+
+
+async def test_unreachable_command_holds_back_the_next(
+    hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
+):
+    await setup_entry(hass, mock_entry)
+    await advertise(hass, mock_entry)
+    coordinator = mock_entry.runtime_data
+    fake_speaker.unreachable = True
+    with pytest.raises(HomeAssistantError):
+        await coordinator.async_set_volume(10)
+    fake_speaker.unreachable = False
+    connects = fake_speaker.connect_count
+    with pytest.raises(HomeAssistantError) as raised:
+        await coordinator.async_set_volume(20)
+    assert raised.value.translation_key == "unreachable"
+    assert fake_speaker.connect_count == connects  # failed without trying
+
+
+async def test_successful_poll_ends_the_hold_back(
+    hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
+):
+    await setup_entry(hass, mock_entry)
+    await advertise(hass, mock_entry)
+    coordinator = mock_entry.runtime_data
+    fake_speaker.unreachable = True
+    with pytest.raises(HomeAssistantError):
+        await coordinator.async_set_volume(10)
+    fake_speaker.unreachable = False
+    await coordinator.async_refresh()
+    await coordinator.async_set_volume(20)
+    assert (VOLUME_UUID, b"\x14") in fake_speaker.writes
+    await coordinator.client.disconnect()

@@ -20,12 +20,19 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
 
 from .client import SoundboksClient
-from .const import CONF_BATTERY_ENTITY, CONF_PIN, CONF_TURN_ON_ENTITY, DOMAIN
+from .const import (
+    CONF_BATTERY_ENTITY,
+    CONF_PIN,
+    CONF_POWER_SWITCH,
+    CONF_TURN_ON_ENTITY,
+    DOMAIN,
+)
 from .protocol import (
     ADVERTISED_SERVICE_UUID,
     InvalidPinError,
     SpeakerUnreachableError,
     UnsupportedSpeakerError,
+    parse_advertisement,
     validate_pin,
 )
 
@@ -36,6 +43,14 @@ def speaker_name(info: BluetoothServiceInfoBleak) -> str:
     """The "#<serial>" part of the advertised name ("AppControl #202047"), else the address."""
     _, hash_sign, serial = (info.name or "").partition("#")
     return f"#{serial}" if hash_sign and serial else info.address
+
+
+def unsupported_firmware(info: BluetoothServiceInfoBleak) -> str | None:
+    """The advertised firmware if it no longer speaks this integration's protocol."""
+    advertisement = parse_advertisement(info.manufacturer_data)
+    if advertisement is None or advertisement.speaks_serial:
+        return None
+    return advertisement.firmware_version
 
 
 class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -49,7 +64,9 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._address = ""
         self._name = ""
-        self._discovered: dict[str, str] = {}  # address -> name
+        self._discovered: dict[str, BluetoothServiceInfoBleak] = {}
+        # Kept across retries: it remembers that it already cleared a stale GATT table
+        self._probe_client: SoundboksClient | None = None
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -59,6 +76,8 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
         self._address = discovery_info.address
         self._name = speaker_name(discovery_info)
         self.context["title_placeholders"] = {"name": self._name}
+        if firmware := unsupported_firmware(discovery_info):
+            return self._abort_unsupported_firmware(firmware)
         return await self.async_step_bluetooth_confirm()
 
     async def async_step_bluetooth_confirm(
@@ -73,12 +92,15 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
             self._address = user_input[CONF_ADDRESS]
             await self.async_set_unique_id(self._address, raise_on_progress=False)
             self._abort_if_unique_id_configured()
-            self._name = self._discovered[self._address]
+            info = self._discovered[self._address]
+            self._name = speaker_name(info)
+            if firmware := unsupported_firmware(info):
+                return self._abort_unsupported_firmware(firmware)
             return await self._async_probe("user")
         configured = self._async_current_ids(include_ignore=False)
         for info in async_discovered_service_info(self.hass, connectable=True):
             if ADVERTISED_SERVICE_UUID in info.service_uuids and info.address not in configured:
-                self._discovered[info.address] = speaker_name(info)
+                self._discovered[info.address] = info
         if not self._discovered:
             return self.async_abort(reason="no_devices_found")
         return self._user_form()
@@ -144,7 +166,11 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def _client(self) -> SoundboksClient:
         device = async_ble_device_from_address(self.hass, self._address, connectable=True)
-        return SoundboksClient(device, None)
+        if self._probe_client is None:
+            self._probe_client = SoundboksClient(device, None)
+        elif device is not None:
+            self._probe_client.set_ble_device(device)  # BlueZ may have recreated it
+        return self._probe_client
 
     async def _async_probe(self, step_id: str) -> ConfigFlowResult:
         """Check the chosen speaker is supported and whether it needs a PIN."""
@@ -186,6 +212,12 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
             data[CONF_PIN] = pin
         return self.async_create_entry(title=f"SOUNDBOKS {self._name}", data=data)
 
+    def _abort_unsupported_firmware(self, firmware: str) -> ConfigFlowResult:
+        return self.async_abort(
+            reason="unsupported_firmware",
+            description_placeholders={"name": self._name, "firmware": firmware},
+        )
+
     def _confirm_form(self, errors: dict[str, str] | None = None) -> ConfigFlowResult:
         return self.async_show_form(
             step_id="bluetooth_confirm",
@@ -194,7 +226,10 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     def _user_form(self, errors: dict[str, str] | None = None) -> ConfigFlowResult:
-        choices = {address: f"{name} ({address})" for address, name in self._discovered.items()}
+        choices = {
+            address: f"{speaker_name(info)} ({address})"
+            for address, info in self._discovered.items()
+        }
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({vol.Required(CONF_ADDRESS): vol.In(choices)}),
@@ -203,7 +238,8 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class SoundboksOptionsFlow(OptionsFlowWithReload):
-    """Optional helpers from outside the speaker: something that turns it on, a battery sensor."""
+    """Optional helpers from outside the speaker: its power, something that turns it on, a
+    battery sensor."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
@@ -212,6 +248,10 @@ class SoundboksOptionsFlow(OptionsFlowWithReload):
         # Optional with a suggested value, not a default: clearing a field removes the option
         schema = vol.Schema(
             {
+                vol.Optional(
+                    CONF_POWER_SWITCH,
+                    description={"suggested_value": options.get(CONF_POWER_SWITCH)},
+                ): EntitySelector(EntitySelectorConfig(domain="switch")),
                 vol.Optional(
                     CONF_TURN_ON_ENTITY,
                     description={"suggested_value": options.get(CONF_TURN_ON_ENTITY)},

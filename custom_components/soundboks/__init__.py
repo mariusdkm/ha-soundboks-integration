@@ -9,10 +9,11 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 
 from .client import SoundboksClient
-from .const import CONF_PIN, IDLE_TIMEOUT, PLATFORMS
-from .coordinator import SoundboksConfigEntry, SoundboksCoordinator
+from .const import CONF_PIN, DOMAIN, IDLE_TIMEOUT, PLATFORMS
+from .coordinator import SoundboksConfigEntry, SoundboksCoordinator, firmware_issue_id
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: SoundboksConfigEntry) -> bool:
@@ -23,6 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SoundboksConfigEntry) ->
         entry.data.get(CONF_PIN),
         idle_timeout=IDLE_TIMEOUT,
         on_volume=lambda raw: coordinator.async_handle_volume(raw),
+        on_inputs=lambda inputs: coordinator.async_handle_inputs(inputs),
     )
     coordinator = SoundboksCoordinator(hass, entry, client)
     entry.runtime_data = coordinator
@@ -49,3 +51,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: SoundboksConfigEntry) -
         await entry.runtime_data.async_shutdown()
         await entry.runtime_data.client.disconnect()
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: SoundboksConfigEntry) -> None:
+    ir.async_delete_issue(hass, DOMAIN, firmware_issue_id(entry.data[CONF_ADDRESS]))

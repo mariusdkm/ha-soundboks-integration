@@ -7,10 +7,8 @@ from enum import IntEnum
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
 from .coordinator import SoundboksConfigEntry, SoundboksCoordinator
 from .entity import SoundboksEntity
 from .protocol import SoundProfile, SpeakerState, StereoRole
@@ -19,7 +17,7 @@ PROFILE_OPTIONS = {
     "power": SoundProfile.POWER,
     "bass_plus": SoundProfile.BASS_PLUS,
     "indoor": SoundProfile.INDOOR,
-    "custom": SoundProfile.CUSTOM,  # shown when set from the app; not selectable here
+    "custom": SoundProfile.CUSTOM,  # the stored custom EQ, set with the EQ band entities
 }
 STEREO_OPTIONS = {"mono": StereoRole.MONO, "left": StereoRole.LEFT, "right": StereoRole.RIGHT}
 
@@ -85,9 +83,6 @@ class SoundboksSelect(SoundboksEntity, SelectEntity):
         )
 
     async def async_select_option(self, option: str) -> None:
-        value = self.entity_description.values[option]
-        if value is SoundProfile.CUSTOM:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN, translation_key="custom_profile"
-            )
-        await self.entity_description.apply(self.coordinator, value)
+        await self.entity_description.apply(
+            self.coordinator, self.entity_description.values[option]
+        )

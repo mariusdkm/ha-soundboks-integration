@@ -12,7 +12,6 @@ from homeassistant.components.select import (
 )
 from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.soundboks.protocol import INPUTS_UUID, POWER_UUID, PROFILE_UUID, STEREO_UUID
@@ -57,15 +56,15 @@ async def test_profile_select_shows_custom(
     assert hass.states.get(PROFILE).state == "custom"
 
 
-async def test_profile_select_custom_rejected(
+async def test_profile_select_custom_keeps_stored_bands(
     hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
 ):
+    fake_speaker.values[PROFILE_UUID] = bytes([0, 1, 26, 51, 76, 101, 51])
     await setup_entry(hass, mock_entry)
     await advertise(hass, mock_entry)
-    with pytest.raises(ServiceValidationError) as raised:
-        await select(hass, PROFILE, "custom")
-    assert raised.value.translation_key == "custom_profile"
-    assert all(uuid != PROFILE_UUID for uuid, _ in fake_speaker.writes)
+    await select(hass, PROFILE, "custom")
+    assert (PROFILE_UUID, bytes([3, 1, 26, 51, 76, 101, 51])) in fake_speaker.writes
+    assert hass.states.get(PROFILE).state == "custom"
 
 
 async def test_stereo_select(

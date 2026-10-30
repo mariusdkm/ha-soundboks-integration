@@ -12,8 +12,15 @@ from collections.abc import Awaitable, Callable
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    clear_cache,
+    close_stale_connections,
+    establish_connection,
+    get_connected_devices,
+)
 
+from .bluez import bluez_path, forget_device, prefer_le
 from .protocol import (
     AUTO_BOOT_ONCE,
     FIRMWARE_UUID,
@@ -24,14 +31,17 @@ from .protocol import (
     PROFILE_UUID,
     REQUIRED_UUIDS,
     SECURITY_UUID,
-    SERIAL_RX_UUID,
-    SERIAL_TX_UUID,
+    SERIAL_RX_UUIDS,
+    SERIAL_TX_UUIDS,
     STEREO_UUID,
     VOLUME_UUID,
+    CommandRefusedError,
+    Input,
     InvalidPinError,
     PinRequiredError,
     ProtocolError,
     RebootIncompleteError,
+    SerialReply,
     SoundProfile,
     SpeakerState,
     SpeakerUnreachableError,
@@ -39,10 +49,13 @@ from .protocol import (
     UnsupportedSpeakerError,
     auth_accepted,
     auth_command,
+    decode_eq,
+    decode_firmware,
     decode_inputs,
     decode_profile,
     decode_stereo,
     decode_volume,
+    encode_custom_eq,
     encode_profile,
     pin_required,
 )
@@ -54,8 +67,11 @@ UNREACHABLE_MESSAGE = (
 )
 CONNECT_ATTEMPTS = 2  # fail fast: the next poll retries anyway
 RESPONSE_TIMEOUT = 5.0
-# The auto-boot write drops the link; reconnecting right after it often fails, so the power-off
-# that completes a reboot is retried for a while
+# The speaker never answers the auto-boot write, so the client waits this long for it to reach
+# the speaker, then moves on (see AUTO_BOOT_ONCE)
+AUTO_BOOT_WAIT = 3.0
+# Reconnecting right after a power write often fails, so the power-off that completes a reboot is
+# retried for a while
 REBOOT_ATTEMPTS = 5
 REBOOT_RETRY_DELAY = 3.0
 LINK_ERRORS = (BleakError, TimeoutError)
@@ -69,17 +85,23 @@ class SoundboksClient:
         *,
         idle_timeout: float = 30.0,
         on_volume: Callable[[int], None] | None = None,
+        on_inputs: Callable[[Input], None] | None = None,
     ) -> None:
         self._ble_device = ble_device
         self._pin = pin
         self._idle_timeout = idle_timeout
         self._on_volume = on_volume
+        self._on_inputs = on_inputs
         self._lock = asyncio.Lock()
         self._client: BleakClient | None = None
         self._authenticated = False
         self._responses: asyncio.Queue[bytes] = asyncio.Queue()
         self._idle_handle: asyncio.TimerHandle | None = None
         self._idle_task: asyncio.Task | None = None
+        # The serial channel's UUIDs as this speaker declares them, found at each connection
+        self._serial_tx: str | None = None
+        # BlueZ's stale GATT table is cleared once; missing characteristics after that are real
+        self._stale_table_cleared = False
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """The latest device seen advertising, used for the next connection."""
@@ -89,9 +111,30 @@ class SoundboksClient:
     def is_connected(self) -> bool:
         return self._client is not None and self._client.is_connected
 
+    async def close_orphaned_link(self) -> bool:
+        """Close a link BlueZ holds to the speaker that isn't ours; True if there was one.
+
+        Such a link happens when a connection attempt is abandoned (it timed out, e.g. while the
+        speaker was off) but BlueZ completes it later. The speaker then stops advertising and
+        refuses everyone else, while nobody uses the link: without this, it stays unreachable
+        until BlueZ or the speaker restarts.
+        """
+        async with self._lock:
+            if self.is_connected or self._ble_device is None:
+                return False
+            if not await get_connected_devices(self._ble_device):
+                return False
+            _LOGGER.warning(
+                "Closing a Bluetooth link to %s that Home Assistant didn't own; it blocked"
+                " every other connection",
+                self._ble_device.address,
+            )
+            await close_stale_connections(self._ble_device)
+            return True
+
     async def check_supported(self) -> None:
         async def check(client: BleakClient) -> None:
-            if any(client.services.get_characteristic(uuid) is None for uuid in REQUIRED_UUIDS):
+            if self._missing_required(client):
                 raise UnsupportedSpeakerError("this speaker model is not supported")
 
         await self._run(check, command=False, authenticate=False)
@@ -113,17 +156,19 @@ class SoundboksClient:
 
     async def read_firmware(self) -> str:
         async def read(client: BleakClient) -> str:
-            return (await self._read(client, FIRMWARE_UUID)).decode(errors="replace").strip()
+            return decode_firmware(await self._read(client, FIRMWARE_UUID))
 
         return await self._run(read, command=False, authenticate=False)
 
     async def read_state(self) -> SpeakerState:
         async def read(client: BleakClient) -> SpeakerState:
+            profile = await self._read(client, PROFILE_UUID)
             return SpeakerState(
                 volume=decode_volume(await self._read(client, VOLUME_UUID)),
-                profile=decode_profile(await self._read(client, PROFILE_UUID)),
+                profile=decode_profile(profile),
                 stereo=decode_stereo(await self._read(client, STEREO_UUID)),
                 inputs=decode_inputs(await self._read(client, INPUTS_UUID)),
+                eq=decode_eq(profile),
             )
 
         return await self._run(read, command=False)
@@ -142,15 +187,42 @@ class SoundboksClient:
 
         await self._run(write, command=True)
 
+    async def set_custom_eq(self, bands: tuple[int, ...]) -> None:
+        """Select the CUSTOM profile with these bands, in dB."""
+        await self._write(PROFILE_UUID, encode_custom_eq(bands))
+
     async def set_stereo(self, role: StereoRole) -> None:
         await self._write(STEREO_UUID, bytes([role]))
 
     async def power_off(self) -> None:
         await self._run(self._power_write(POWER_OFF), command=False)
 
+    async def arm_auto_boot(self) -> None:
+        """Make the speaker boot by itself the next time it gets power, once.
+
+        Cutting its power afterwards turns it off in a way that restoring the power undoes. The
+        speaker never answers this write, so after a short wait it counts as done.
+        """
+
+        async def arm(client: BleakClient) -> None:
+            try:
+                async with asyncio.timeout(AUTO_BOOT_WAIT):
+                    await client.write_gatt_char(POWER_UUID, AUTO_BOOT_ONCE, response=True)
+            except TimeoutError:
+                _LOGGER.debug("No answer to the auto-boot write, as expected")
+            except BleakError:
+                if client.is_connected:
+                    raise  # refused, not dropped: nothing is armed
+                # Some firmware drops the link instead of answering, like after a power-off
+                _LOGGER.debug("Link dropped after the auto-boot write")
+            # The write is still pending in BlueZ: nothing else can use this link
+            await self._drop()
+
+        await self._run(arm, command=False)
+
     async def reboot(self) -> None:
         """Auto-boot once, then power off: the speaker restarts by itself."""
-        await self._run(self._power_write(AUTO_BOOT_ONCE), command=False)
+        await self.arm_auto_boot()
         for _ in range(REBOOT_ATTEMPTS):
             await asyncio.sleep(REBOOT_RETRY_DELAY)
             try:
@@ -160,6 +232,27 @@ class SoundboksClient:
             else:
                 return
         raise RebootIncompleteError("the speaker will restart at its next power-off instead of now")
+
+    async def query(self, opcodes: tuple[str, ...]) -> dict[str, bytes | str]:
+        """Send read-only serial commands in turn: each one's reply payload, or what went wrong.
+
+        Stops at the first command without a complete answer: a late reply would be taken for
+        the next command's.
+        """
+
+        async def run(client: BleakClient) -> dict[str, bytes | str]:
+            results: dict[str, bytes | str] = {}
+            for opcode in opcodes:
+                try:
+                    results[opcode] = await self._serial_request(client, opcode)
+                except CommandRefusedError as err:
+                    results[opcode] = f"refused: {err}"
+                except (TimeoutError, ProtocolError) as err:
+                    results[opcode] = f"no valid answer: {str(err) or 'timed out'}"
+                    break
+            return results
+
+        return await self._run(run, command=False)
 
     async def disconnect(self) -> None:
         async with self._lock:
@@ -220,6 +313,10 @@ class SoundboksClient:
             return self._client
         if self._ble_device is None:
             raise SpeakerUnreachableError(UNREACHABLE_MESSAGE)
+        # A dual-mode speaker (the Go) has no control services over BR/EDR: see bluez.py
+        await prefer_le(self._ble_device)
+        # A link we don't own would make this connection fail: see close_orphaned_link
+        await close_stale_connections(self._ble_device)
         try:
             client = await establish_connection(
                 BleakClientWithServiceCache,
@@ -233,11 +330,49 @@ class SoundboksClient:
         self._client = client
         self._authenticated = False
         self._responses = asyncio.Queue()
+        if not self._missing_required(client):
+            # A stale table that comes back later (BlueZ recreated the device) is cleared again
+            self._stale_table_cleared = False
+        elif await self._clear_stale_table():
+            raise SpeakerUnreachableError(UNREACHABLE_MESSAGE)
+        self._serial_tx = _first_present(client, SERIAL_TX_UUIDS)
         # Keep this subscription for the link's lifetime: unsubscribing drops the authentication
-        await client.start_notify(SERIAL_RX_UUID, self._on_response)
+        if serial_rx := _first_present(client, SERIAL_RX_UUIDS):
+            await client.start_notify(serial_rx, self._on_response)
         if self._on_volume is not None:
             await client.start_notify(VOLUME_UUID, self._on_volume_notification)
+        if self._on_inputs is not None and client.services.get_characteristic(INPUTS_UUID):
+            try:
+                await client.start_notify(INPUTS_UUID, self._on_inputs_notification)
+            except BleakError:
+                # Polls still read the inputs; only the live updates are lost
+                _LOGGER.debug("Could not subscribe to the sound status", exc_info=True)
         return client
+
+    @staticmethod
+    def _missing_required(client: BleakClient) -> bool:
+        return any(client.services.get_characteristic(uuid) is None for uuid in REQUIRED_UUIDS)
+
+    async def _clear_stale_table(self) -> bool:
+        """Forget the speaker in BlueZ once, in case its GATT table is a BR/EDR leftover.
+
+        True when it tried: the link is dropped either way, and the next connection starts over.
+        Only for a speaker behind a local BlueZ adapter; elsewhere the table is what it is.
+        """
+        device = self._ble_device
+        if self._stale_table_cleared or device is None or bluez_path(device) is None:
+            return False
+        self._stale_table_cleared = True
+        await self._drop()
+        # bleak-retry-connector keeps its own copy of the table, which would outlive BlueZ's
+        await clear_cache(device.address)
+        if await forget_device(device):
+            _LOGGER.warning(
+                "%s lacked its control characteristics, likely a table cached from a classic "
+                "Bluetooth connection; cleared it, the next connection reads it again",
+                device.address,
+            )
+        return True
 
     async def _ensure_authenticated(self, client: BleakClient) -> None:
         if self._authenticated:
@@ -249,13 +384,29 @@ class SoundboksClient:
         self._authenticated = True
 
     async def _authenticate(self, client: BleakClient, pin: str) -> None:
-        while not self._responses.empty():
-            self._responses.get_nowait()
-        await client.write_gatt_char(SERIAL_TX_UUID, auth_command(pin), response=True)
+        if self._serial_tx is None:
+            raise UnsupportedSpeakerError("the speaker has a PIN but no serial channel to send it")
+        self._discard_responses()
+        await client.write_gatt_char(self._serial_tx, auth_command(pin), response=True)
         answer = await asyncio.wait_for(self._responses.get(), RESPONSE_TIMEOUT)
         if not auth_accepted(answer):
             raise InvalidPinError("the speaker refused the PIN")
         self._authenticated = True
+
+    async def _serial_request(self, client: BleakClient, opcode: str) -> bytes:
+        if self._serial_tx is None:
+            raise UnsupportedSpeakerError("the speaker has no serial channel")
+        self._discard_responses()
+        reply = SerialReply(opcode)
+        await client.write_gatt_char(self._serial_tx, opcode.encode(), response=True)
+        async with asyncio.timeout(RESPONSE_TIMEOUT):
+            while (payload := reply.feed(await self._responses.get())) is None:
+                pass
+        return payload
+
+    def _discard_responses(self) -> None:
+        while not self._responses.empty():
+            self._responses.get_nowait()
 
     @staticmethod
     async def _read(client: BleakClient, uuid: str) -> bytes:
@@ -272,6 +423,15 @@ class SoundboksClient:
             return
         if self._on_volume is not None:
             self._on_volume(raw)
+
+    def _on_inputs_notification(self, _sender: object, data: bytearray) -> None:
+        try:
+            inputs = decode_inputs(bytes(data))
+        except ProtocolError:
+            _LOGGER.debug("Ignoring sound status notification %s", bytes(data).hex())
+            return
+        if self._on_inputs is not None:
+            self._on_inputs(inputs)
 
     def _on_disconnected(self, client: BleakClient) -> None:
         if client is self._client:
@@ -300,3 +460,7 @@ class SoundboksClient:
                 await client.disconnect()
             except LINK_ERRORS:
                 _LOGGER.debug("Error while disconnecting", exc_info=True)
+
+
+def _first_present(client: BleakClient, uuids: tuple[str, ...]) -> str | None:
+    return next((uuid for uuid in uuids if client.services.get_characteristic(uuid)), None)

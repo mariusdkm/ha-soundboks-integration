@@ -7,7 +7,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.soundboks.const import CONF_BATTERY_ENTITY, CONF_TURN_ON_ENTITY
+from custom_components.soundboks.const import (
+    CONF_BATTERY_ENTITY,
+    CONF_POWER_SWITCH,
+    CONF_TURN_ON_ENTITY,
+)
 
 from .conftest import FakeSpeaker, advertise, make_entry, setup_entry
 
@@ -59,3 +63,12 @@ async def test_options_change_reloads_without_error(
     await configure(hass, mock_entry, {CONF_TURN_ON_ENTITY: "script.speaker_on"})
     assert mock_entry.state is ConfigEntryState.LOADED
     assert hass.states.get(MEDIA_PLAYER).state == STATE_ON
+
+
+async def test_options_set_power_switch(
+    hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
+):
+    await setup_entry(hass, mock_entry)
+    result = await configure(hass, mock_entry, {CONF_POWER_SWITCH: "switch.speaker_plug"})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert mock_entry.options == {CONF_POWER_SWITCH: "switch.speaker_plug"}

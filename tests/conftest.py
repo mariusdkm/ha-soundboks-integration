@@ -1,5 +1,6 @@
 """Shared fixtures: a fake speaker standing in for the BLE stack."""
 
+import asyncio
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.soundboks.const import DOMAIN
 from custom_components.soundboks.protocol import (
     ADVERTISED_SERVICE_UUID,
+    AUTO_BOOT_ONCE,
     FIRMWARE_UUID,
     INPUTS_UUID,
     POWER_UUID,
@@ -45,6 +47,7 @@ def auto_enable_custom_integrations(enable_custom_integrations):
 def no_reboot_delay(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reboot retries wait between reconnects; tests don't need to."""
     monkeypatch.setattr("custom_components.soundboks.client.REBOOT_RETRY_DELAY", 0)
+    monkeypatch.setattr("custom_components.soundboks.client.AUTO_BOOT_WAIT", 0.01)
 
 
 def make_ble_device() -> BLEDevice:
@@ -69,7 +72,17 @@ class FakeSpeaker:
     pin: str | None = None
     unreachable: bool = False
     drop_on_power_write: bool = True
+    # Like the real speaker: the auto-boot write is never answered, and the link stays up
+    hang_on_auto_boot: bool = False
+    # Serial command -> the RX notifications answering it
+    serial_replies: dict[bytes, list[bytes]] = field(default_factory=dict)
     failing_reads: set[str] = field(default_factory=set)
+    # Writes refused with a GATT error, the link staying up
+    failing_writes: set[str] = field(default_factory=set)
+    # The serial channel's (TX, RX) UUIDs; some firmware declares the 16-bit forms
+    serial: tuple[str, str] = (SERIAL_TX_UUID, SERIAL_RX_UUID)
+    # Characteristics missing from the GATT table the next connections see
+    hidden: set[str] = field(default_factory=set)
     # Connects that fail right after a power write, as a speaker restarting its radio would
     failing_connects_after_power_write: int = 0
     writes: list[tuple[str, bytes]] = field(default_factory=list)
@@ -87,11 +100,11 @@ class FakeSpeaker:
 
 
 class FakeServices:
-    def __init__(self, values: dict[str, bytes]) -> None:
-        self._values = values
+    def __init__(self, speaker: FakeSpeaker) -> None:
+        self._uuids = (set(speaker.values) | set(speaker.serial)) - speaker.hidden
 
     def get_characteristic(self, uuid: str) -> object | None:
-        return object() if uuid in self._values else None
+        return object() if uuid in self._uuids else None
 
 
 class FakeBleakClient:
@@ -102,7 +115,7 @@ class FakeBleakClient:
         self.is_connected = True
         self.authenticated = speaker.pin is None
         self.callbacks: dict[str, Callable] = {}
-        self.services = FakeServices(speaker.values)
+        self.services = FakeServices(speaker)
         self._disconnected_callback = disconnected_callback
 
     def _check(self) -> None:
@@ -116,18 +129,26 @@ class FakeBleakClient:
         return bytearray(self.speaker.values[uuid])
 
     async def write_gatt_char(self, uuid: str, data: bytes, response: bool = False) -> None:
+        await asyncio.sleep(0)  # a real write suspends, letting concurrent callers interleave
         self._check()
         data = bytes(data)
         self.speaker.writes.append((uuid, data))
-        if uuid == SERIAL_TX_UUID:
+        tx, rx = self.speaker.serial
+        if uuid == tx:
             if data.startswith(b"aup"):
                 accepted = data[3:].decode() == self.speaker.pin
                 self.authenticated = self.authenticated or accepted
                 answer = b"\x01\x00\x00\x00\x00" if accepted else b"\x02\x00"
-                self.callbacks[SERIAL_RX_UUID](None, bytearray(answer))
+                self.callbacks[rx](None, bytearray(answer))
+            for packet in self.speaker.serial_replies.get(data, []):
+                self.callbacks[rx](None, bytearray(packet))
             return
         if not self.authenticated:
             raise BleakError("ATT error 0x81")
+        if uuid in self.speaker.failing_writes:
+            raise BleakError("ATT error 0x03")
+        if uuid == POWER_UUID and data == AUTO_BOOT_ONCE and self.speaker.hang_on_auto_boot:
+            await asyncio.Event().wait()
         if uuid == POWER_UUID:
             self.speaker.failing_connects = self.speaker.failing_connects_after_power_write
         if uuid == POWER_UUID and self.speaker.drop_on_power_write:
@@ -167,13 +188,15 @@ def fake_speaker() -> Iterator[FakeSpeaker]:
         yield speaker
 
 
-def make_service_info(age: float = 0.0) -> BluetoothServiceInfoBleak:
+def make_service_info(
+    age: float = 0.0, manufacturer_data: dict[int, bytes] | None = None
+) -> BluetoothServiceInfoBleak:
     """An advertisement heard age seconds ago."""
     return BluetoothServiceInfoBleak(
         name=f"AppControl {NAME}",
         address=ADDRESS,
         rssi=-60,
-        manufacturer_data={},
+        manufacturer_data=manufacturer_data or {},
         service_data={},
         service_uuids=[ADVERTISED_SERVICE_UUID],
         source="local",
@@ -210,13 +233,15 @@ async def setup_entry(hass: HomeAssistant, entry: MockConfigEntry) -> None:
         await hass.async_block_till_done()
 
 
-async def advertise(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+async def advertise(
+    hass: HomeAssistant, entry: MockConfigEntry, manufacturer_data: dict[int, bytes] | None = None
+) -> None:
     """The speaker shows up, through HA's Bluetooth manager like a real advertisement.
 
     Going through the manager matters: it keeps the advertisement history the integration
     reads, and skips integration callbacks for repeated identical advertisements.
     """
-    async_get_advertisement_callback(hass)(make_service_info())
+    async_get_advertisement_callback(hass)(make_service_info(manufacturer_data=manufacturer_data))
     await hass.async_block_till_done()
 
 

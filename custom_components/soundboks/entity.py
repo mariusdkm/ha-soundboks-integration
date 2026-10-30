@@ -17,7 +17,11 @@ class SoundboksEntity(CoordinatorEntity[SoundboksCoordinator]):
             identifiers={(DOMAIN, coordinator.address)},
             connections={(CONNECTION_BLUETOOTH, coordinator.address)},
             manufacturer=MANUFACTURER,
-            model="SOUNDBOKS (BLE)",
+            model=(
+                coordinator.advertisement.model_name
+                if coordinator.advertisement
+                else "SOUNDBOKS (BLE)"
+            ),
             name=coordinator.config_entry.title,
             sw_version=coordinator.firmware,
         )

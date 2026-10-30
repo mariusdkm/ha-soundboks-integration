@@ -53,7 +53,8 @@
       "no_devices_found": "No SOUNDBOKS speaker found. Check it is on and nearby, and that no other app is connected to it.",
       "not_supported": "This SOUNDBOKS model is not supported yet.",
       "reauth_successful": "PIN updated.",
-      "reconfigure_successful": "PIN updated."
+      "reconfigure_successful": "PIN updated.",
+      "unsupported_firmware": "SOUNDBOKS {name} runs firmware {firmware}. From firmware 3.0 the speaker uses a newer protocol this integration doesn't speak yet."
     }
   },
   "exceptions": {
@@ -63,17 +64,34 @@
     "invalid_pin": {
       "message": "The speaker refused the PIN. Re-enter it from the integration's settings."
     },
-    "custom_profile": {
-      "message": "Custom EQ can only be set from the SOUNDBOKS app for now."
-    },
     "reboot_incomplete": {
       "message": "The speaker didn't restart: it will restart the next time it is turned off instead. Try the reboot again."
     },
-    "turn_on_entity_missing": {
-      "message": "The turn-on action {entity_id} doesn't exist. Pick another in the integration's settings."
+    "nothing_to_unmute": {
+      "message": "There's no earlier volume to restore. Set a volume instead."
+    },
+    "unknown_sound_mode": {
+      "message": "Unknown sound mode {sound_mode}."
+    },
+    "entity_missing": {
+      "message": "{entity_id} doesn't exist. Pick another in the integration's settings."
+    },
+    "auto_boot_not_armed": {
+      "message": "Couldn't reach the speaker to make it start again when its power returns, so its power was left on. Try again, or turn it off with its knob."
+    },
+    "no_power_switch": {
+      "message": "No power switch is set in the integration's settings."
+    },
+    "unsupported_firmware": {
+      "message": "The speaker runs firmware {firmware}, which this integration doesn't speak yet."
     }
   },
   "entity": {
+    "binary_sensor": {
+      "connection": {
+        "name": "Connection"
+      }
+    },
     "select": {
       "sound_profile": {
         "name": "Sound profile",
@@ -102,6 +120,11 @@
       "reboot": {
         "name": "Reboot"
       }
+    },
+    "number": {
+      "eq_band": {
+        "name": "EQ band {band}"
+      }
     }
   },
   "options": {
@@ -110,14 +133,22 @@
         "title": "Extras",
         "description": "Optional helpers for things the speaker can't do over Bluetooth.",
         "data": {
+          "power_switch": "Power switch",
           "turn_on_entity": "Turn-on action",
           "battery_entity": "Battery sensor"
         },
         "data_description": {
+          "power_switch": "A switch (for example a smart plug) in the line of the speaker's charger, with the speaker running from it alone, no battery. Turning the speaker off then makes it start by itself when the power returns, and cuts the power; turning it on switches the power back on. If the power is cut some other way, or the speaker is turned off with its knob, only the knob turns it on again. Takes over from the turn-on action.",
           "turn_on_entity": "A script or button that turns the speaker on, for example one that triggers a device pressing its power button. The media player's power button then turns the speaker on.",
           "battery_entity": "A battery sensor for this speaker, measured some other way. It's shown on the speaker's device."
         }
       }
+    }
+  },
+  "issues": {
+    "unsupported_firmware": {
+      "title": "{name} runs unsupported firmware",
+      "description": "{name} advertises firmware {firmware}. From firmware 3.0 the speaker uses a newer protocol this integration doesn't speak yet, so Home Assistant stopped connecting to it."
     }
   }
 }
