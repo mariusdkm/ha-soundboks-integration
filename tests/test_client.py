@@ -6,6 +6,9 @@ import pytest
 
 from custom_components.soundboks.client import SoundboksClient
 from custom_components.soundboks.protocol import (
+    AUTO_BOOT_ONCE,
+    FIRMWARE_UUID,
+    POWER_OFF,
     POWER_UUID,
     PROFILE_UUID,
     SECURITY_UUID,
@@ -23,7 +26,7 @@ from custom_components.soundboks.protocol import (
     UnsupportedSpeakerError,
 )
 
-from .conftest import FakeSpeaker, make_ble_device
+from .conftest import FakeSpeaker, make_ble_device, power_writes
 
 
 def make_client(pin: str | None = None, **kwargs) -> SoundboksClient:
@@ -60,7 +63,6 @@ async def test_burst_reuses_connection(fake_speaker: FakeSpeaker):
     for raw in (10, 20, 30):
         await client.set_volume(raw)
     assert fake_speaker.connect_count == 1
-    await client.disconnect()
 
 
 async def test_concurrent_operations_share_one_connection(fake_speaker: FakeSpeaker):
@@ -71,7 +73,6 @@ async def test_concurrent_operations_share_one_connection(fake_speaker: FakeSpea
         (VOLUME_UUID, b"\x01"),
         (VOLUME_UUID, b"\x02"),
     ]
-    await client.disconnect()
 
 
 async def test_power_off_treats_dropped_link_as_success(fake_speaker: FakeSpeaker):
@@ -88,11 +89,19 @@ async def test_power_off_without_link_drop(fake_speaker: FakeSpeaker):
     assert client.is_connected is False
 
 
-async def test_reboot_writes_auto_boot_then_off(fake_speaker: FakeSpeaker):
+@pytest.mark.parametrize(
+    ("hang_on_auto_boot", "failing_connects"),
+    [(False, 0), (True, 0), (False, 2)],
+    ids=["link_dropped", "arm_unanswered", "reconnect_retried"],
+)
+async def test_reboot_writes_auto_boot_then_off(
+    fake_speaker: FakeSpeaker, hang_on_auto_boot: bool, failing_connects: int
+):
+    fake_speaker.hang_on_auto_boot = hang_on_auto_boot
+    fake_speaker.failing_connects_after_power_write = failing_connects
     client = make_client()
     await client.reboot()
-    power_writes = [data for uuid, data in fake_speaker.writes if uuid == POWER_UUID]
-    assert power_writes == [b"\x01\x01", b"\x00"]
+    assert power_writes(fake_speaker) == [AUTO_BOOT_ONCE, POWER_OFF]
     assert fake_speaker.connect_count == 2
     assert client.is_connected is False
 
@@ -103,31 +112,24 @@ async def test_pin_auth_sent_when_required(fake_speaker: FakeSpeaker):
     await client.set_volume(50)
     assert fake_speaker.writes[0] == (SERIAL_TX_UUID, b"aup1234")
     assert fake_speaker.values[VOLUME_UUID] == b"\x32"
-    await client.disconnect()
 
 
 async def test_no_auth_without_pin(fake_speaker: FakeSpeaker):
     client = make_client("1234")
     await client.set_volume(50)
     assert all(uuid != SERIAL_TX_UUID for uuid, _ in fake_speaker.writes)
-    await client.disconnect()
 
 
-async def test_wrong_pin_raises(fake_speaker: FakeSpeaker):
+@pytest.mark.parametrize(("pin", "error"), [("1234", InvalidPinError), (None, PinRequiredError)])
+async def test_wrong_or_missing_pin_raises(
+    fake_speaker: FakeSpeaker, pin: str | None, error: type[Exception]
+):
     fake_speaker.set_pin("9999")
-    client = make_client("1234")
-    with pytest.raises(InvalidPinError):
+    client = make_client(pin)
+    with pytest.raises(error):
         await client.set_volume(50)
     assert client.is_connected is False
     assert fake_speaker.values[VOLUME_UUID] == b"\x2d"
-
-
-async def test_missing_pin_raises(fake_speaker: FakeSpeaker):
-    fake_speaker.set_pin("1234")
-    client = make_client(None)
-    with pytest.raises(PinRequiredError):
-        await client.set_volume(50)
-    assert client.is_connected is False
 
 
 async def test_pin_required_and_verify_pin(fake_speaker: FakeSpeaker):
@@ -139,7 +141,6 @@ async def test_pin_required_and_verify_pin(fake_speaker: FakeSpeaker):
     await client.verify_pin("1234")
     await client.set_volume(50)  # the verified PIN is used from now on
     assert fake_speaker.values[VOLUME_UUID] == b"\x32"
-    await client.disconnect()
 
 
 async def test_unreachable_raises(fake_speaker: FakeSpeaker):
@@ -165,14 +166,12 @@ async def test_set_profile_keeps_bands(fake_speaker: FakeSpeaker):
     client = make_client()
     await client.set_profile(SoundProfile.INDOOR)
     assert (PROFILE_UUID, bytes([2, 1, 2, 3, 4, 5, 6])) in fake_speaker.writes
-    await client.disconnect()
 
 
 async def test_set_stereo(fake_speaker: FakeSpeaker):
     client = make_client()
     await client.set_stereo(StereoRole.LEFT)
     assert (STEREO_UUID, b"\x01") in fake_speaker.writes
-    await client.disconnect()
 
 
 async def test_set_volume_rejects_out_of_range(fake_speaker: FakeSpeaker):
@@ -195,8 +194,13 @@ async def test_check_supported_ignores_pin(fake_speaker: FakeSpeaker):
     assert fake_speaker.values[SECURITY_UUID] == b"\x01"
 
 
-async def test_read_firmware(fake_speaker: FakeSpeaker):
-    assert await make_client().read_firmware() == "2.4.2"
+@pytest.mark.parametrize(
+    ("raw", "version"),
+    [(b"2.4.2", "2.4.2"), (bytes([2, 0x2E, 4, 0x2E, 3]), "2.4.3")],  # a Go sends raw numbers
+)
+async def test_read_firmware(fake_speaker: FakeSpeaker, raw: bytes, version: str):
+    fake_speaker.values[FIRMWARE_UUID] = raw
+    assert await make_client().read_firmware() == version
 
 
 async def test_volume_notifications_forwarded(fake_speaker: FakeSpeaker):
@@ -205,15 +209,6 @@ async def test_volume_notifications_forwarded(fake_speaker: FakeSpeaker):
     await client.set_volume(10)
     fake_speaker.notify(VOLUME_UUID, b"\x40")
     assert seen == [0x40]
-    await client.disconnect()
-
-
-async def test_reboot_retries_reconnect(fake_speaker: FakeSpeaker):
-    fake_speaker.failing_connects_after_power_write = 2
-    client = make_client()
-    await client.reboot()
-    power_writes = [data for uuid, data in fake_speaker.writes if uuid == POWER_UUID]
-    assert power_writes == [b"\x01\x01", b"\x00"]
 
 
 async def test_reboot_reports_armed_restart(fake_speaker: FakeSpeaker):
@@ -221,5 +216,4 @@ async def test_reboot_reports_armed_restart(fake_speaker: FakeSpeaker):
     client = make_client()
     with pytest.raises(RebootIncompleteError):
         await client.reboot()
-    power_writes = [data for uuid, data in fake_speaker.writes if uuid == POWER_UUID]
-    assert power_writes == [b"\x01\x01"]
+    assert power_writes(fake_speaker) == [AUTO_BOOT_ONCE]

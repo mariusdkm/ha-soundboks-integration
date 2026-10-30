@@ -55,10 +55,7 @@ async def forget_device(device: BLEDevice) -> bool:
     Only for an unpaired device: BlueZ creates it afresh from its next advertisement. Removing a
     paired one would delete its pairing too, e.g. a Go the host streams audio to.
     """
-    if (path := bluez_path(device)) is None:
-        return False
-    properties = await _device_properties(path)
-    if properties is None or properties.get("Paired") or properties.get("Bonded"):
+    if (path := bluez_path(device)) is None or not await removable(device):
         _LOGGER.debug("Not removing %s from BlueZ: paired, or unknown", device.address)
         return False
     adapter = path.rsplit("/", 1)[0]
@@ -67,6 +64,14 @@ async def forget_device(device: BLEDevice) -> bool:
         _LOGGER.debug("Could not remove %s from BlueZ: %s", device.address, error)
         return False
     return True
+
+
+async def removable(device: BLEDevice) -> bool:
+    """Whether BlueZ knows the device and it isn't paired, so removing it loses nothing."""
+    if (path := bluez_path(device)) is None:
+        return False
+    properties = await _device_properties(path)
+    return properties is not None and not properties.get("Paired") and not properties.get("Bonded")
 
 
 async def _device_properties(path: str) -> dict[str, object] | None:

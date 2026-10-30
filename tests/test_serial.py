@@ -34,14 +34,6 @@ async def test_arm_auto_boot_tolerates_a_dropped_link(fake_speaker: FakeSpeaker)
     assert client.is_connected is False
 
 
-async def test_reboot_with_unanswered_auto_boot(fake_speaker: FakeSpeaker):
-    fake_speaker.hang_on_auto_boot = True
-    client = make_client()
-    await client.reboot()
-    power_writes = [data for uuid, data in fake_speaker.writes if uuid == POWER_UUID]
-    assert power_writes == [AUTO_BOOT_ONCE, b"\x00"]
-
-
 async def test_query_framed_unframed_and_refused(fake_speaker: FakeSpeaker):
     fake_speaker.serial_replies = {
         b"fwv": [b"\x02\x2e\x04\x2e\x03"],
@@ -86,7 +78,6 @@ async def test_inputs_notifications_reach_the_callback(fake_speaker: FakeSpeaker
     fake_speaker.notify(INPUTS_UUID, b"\x00")  # malformed: ignored
     fake_speaker.notify(INPUTS_UUID, bytes.fromhex("000c01020008"))
     assert seen == [Input.AUX, Input.AUX | Input.BLUETOOTH]
-    await client.disconnect()
 
 
 async def test_speaker_without_sound_status_still_connects(fake_speaker: FakeSpeaker):
@@ -94,7 +85,6 @@ async def test_speaker_without_sound_status_still_connects(fake_speaker: FakeSpe
     client = make_client(on_inputs=lambda _inputs: pytest.fail("no sound status to notify"))
     await client.set_volume(10)
     assert INPUTS_UUID not in fake_speaker.client.callbacks
-    await client.disconnect()
 
 
 async def test_refused_auto_boot_write_is_an_error(fake_speaker: FakeSpeaker):

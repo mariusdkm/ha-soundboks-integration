@@ -1,6 +1,8 @@
 """What a SOUNDBOKS Go (firmware 2.4.3) does differently, and the BlueZ workarounds for it."""
 
 from collections.abc import Iterator
+from dataclasses import dataclass
+from time import monotonic
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -9,7 +11,6 @@ from bleak.backends.device import BLEDevice
 from custom_components.soundboks import bluez
 from custom_components.soundboks.client import SoundboksClient
 from custom_components.soundboks.protocol import (
-    FIRMWARE_UUID,
     PROFILE_UUID,
     SERIAL_RX_SHORT_UUID,
     SERIAL_RX_UUID,
@@ -25,6 +26,7 @@ from custom_components.soundboks.protocol import (
 from .conftest import ADDRESS, NAME, FakeSpeaker, make_ble_device
 
 BLUEZ_PATH = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"
+CLIENT = "custom_components.soundboks.client"
 
 
 def bluez_device() -> BLEDevice:
@@ -38,17 +40,27 @@ def no_system_bus() -> Iterator[None]:
         yield
 
 
+@dataclass
+class Clearing:
+    removable: AsyncMock
+    clear_cache: AsyncMock
+    forget: AsyncMock
+
+
 @pytest.fixture
-def forget() -> Iterator[AsyncMock]:
-    """BlueZ's forget, with bleak-retry-connector's cache clearing alongside it."""
+def clearing() -> Iterator[Clearing]:
+    """Clearing a bad GATT table: an unpaired speaker, with a copy in bleak-retry-connector."""
     with (
-        patch(
-            "custom_components.soundboks.client.forget_device", AsyncMock(return_value=True)
-        ) as forget,
-        patch("custom_components.soundboks.client.clear_cache", AsyncMock()) as clear,
+        patch(f"{CLIENT}.removable", AsyncMock(return_value=True)) as removable,
+        patch(f"{CLIENT}.clear_cache", AsyncMock(return_value=True)) as clear,
+        patch(f"{CLIENT}.forget_device", AsyncMock(return_value=True)) as forget,
     ):
-        forget.clear_cache = clear
-        yield forget
+        yield Clearing(removable, clear, forget)
+
+
+def minutes_later(monkeypatch: pytest.MonkeyPatch, minutes: float) -> None:
+    now = monotonic()
+    monkeypatch.setattr(f"{CLIENT}.monotonic", lambda: now + minutes * 60)
 
 
 async def test_serial_channel_under_16_bit_uuids(fake_speaker: FakeSpeaker):
@@ -59,7 +71,6 @@ async def test_serial_channel_under_16_bit_uuids(fake_speaker: FakeSpeaker):
     assert fake_speaker.writes[0] == (SERIAL_TX_SHORT_UUID, b"aup1234")
     with pytest.raises(InvalidPinError):
         await SoundboksClient(make_ble_device(), "9999").verify_pin("9999")
-    await client.disconnect()
 
 
 async def test_no_serial_channel_is_fine_without_pin(fake_speaker: FakeSpeaker):
@@ -67,7 +78,6 @@ async def test_no_serial_channel_is_fine_without_pin(fake_speaker: FakeSpeaker):
     client = SoundboksClient(make_ble_device(), None)
     await client.set_volume(50)
     assert fake_speaker.values[VOLUME_UUID] == b"\x32"
-    await client.disconnect()
 
 
 async def test_no_serial_channel_with_pin_is_unsupported(fake_speaker: FakeSpeaker):
@@ -77,11 +87,6 @@ async def test_no_serial_channel_with_pin_is_unsupported(fake_speaker: FakeSpeak
         await SoundboksClient(make_ble_device(), "1234").set_volume(50)
 
 
-async def test_raw_firmware_version(fake_speaker: FakeSpeaker):
-    fake_speaker.values[FIRMWARE_UUID] = bytes([2, 0x2E, 4, 0x2E, 3])
-    assert await SoundboksClient(make_ble_device(), None).read_firmware() == "2.4.3"
-
-
 async def test_eq_read_and_written(fake_speaker: FakeSpeaker):
     fake_speaker.values[PROFILE_UUID] = bytes([2, 0, 0, 0, 0, 0, 0])  # never set
     client = SoundboksClient(make_ble_device(), None)
@@ -89,30 +94,61 @@ async def test_eq_read_and_written(fake_speaker: FakeSpeaker):
     assert state.profile is SoundProfile.INDOOR and state.eq == (0,) * 6
     await client.set_custom_eq((4, 2, 0, 0, -2, -4))
     assert fake_speaker.values[PROFILE_UUID] == bytes([3, 71, 61, 51, 51, 41, 31])
-    await client.disconnect()
 
 
-async def test_stale_table_is_cleared_once(fake_speaker: FakeSpeaker, forget: AsyncMock):
-    """A table cached from a BR/EDR connection lacks the controls: forget it, then retry."""
+async def test_bad_table_is_cleared_and_retried_later(
+    fake_speaker: FakeSpeaker, clearing: Clearing, monkeypatch: pytest.MonkeyPatch
+):
+    """A table lacking the controls: cleared, and cleared again if it comes back bad.
+
+    It comes back bad when it was read again while the speaker booted, or the speaker really
+    lacks the controls; the retry window keeps the latter from clearing it at every poll.
+    """
     fake_speaker.hidden = {VOLUME_UUID}
     client = SoundboksClient(bluez_device(), None)
     with pytest.raises(SpeakerUnreachableError):
         await client.read_state()
-    forget.assert_awaited_once()
-    forget.clear_cache.assert_awaited_once_with(ADDRESS)
+    clearing.clear_cache.assert_awaited_once_with(ADDRESS)
+    clearing.forget.assert_not_awaited()  # clearing the copy removed BlueZ's device already
     assert client.is_connected is False
-    # Still missing after a fresh table: really unsupported, and not forgotten again
+    # Still missing right away: reported as unsupported, not cleared again
     with pytest.raises(UnsupportedSpeakerError):
         await client.check_supported()
-    forget.assert_awaited_once()
+    assert clearing.clear_cache.await_count == 1
+    minutes_later(monkeypatch, 2)
+    with pytest.raises(SpeakerUnreachableError):
+        await client.read_state()
+    assert clearing.clear_cache.await_count == 2
 
 
-async def test_stale_table_left_alone_off_bluez(fake_speaker: FakeSpeaker, forget: AsyncMock):
+async def test_bad_table_forgotten_in_bluez_without_a_cached_copy(
+    fake_speaker: FakeSpeaker, clearing: Clearing
+):
+    clearing.clear_cache.return_value = False
+    fake_speaker.hidden = {VOLUME_UUID}
+    with pytest.raises(SpeakerUnreachableError):
+        await SoundboksClient(bluez_device(), None).read_state()
+    clearing.forget.assert_awaited_once()
+
+
+async def test_bad_table_of_a_paired_speaker_left_alone(
+    fake_speaker: FakeSpeaker, clearing: Clearing
+):
+    """Clearing it would remove the device from BlueZ, and its pairing with it."""
+    clearing.removable.return_value = False
+    fake_speaker.hidden = {VOLUME_UUID}
+    with pytest.raises(UnsupportedSpeakerError):
+        await SoundboksClient(bluez_device(), None).check_supported()
+    clearing.clear_cache.assert_not_awaited()
+    clearing.forget.assert_not_awaited()
+
+
+async def test_stale_table_left_alone_off_bluez(fake_speaker: FakeSpeaker, clearing: Clearing):
     """Through a proxy there is no BlueZ table to clear: just report the speaker unsupported."""
     fake_speaker.hidden = {VOLUME_UUID}
     with pytest.raises(UnsupportedSpeakerError):
         await SoundboksClient(make_ble_device(), None).check_supported()
-    forget.assert_not_awaited()
+    clearing.clear_cache.assert_not_awaited()
 
 
 async def test_le_preferred_before_each_connection(fake_speaker: FakeSpeaker):
@@ -182,7 +218,7 @@ async def test_forget_device_keeps_it_when_properties_are_unknown():
 
 
 async def test_stale_table_is_cleared_again_after_a_full_table(
-    fake_speaker: FakeSpeaker, forget: AsyncMock
+    fake_speaker: FakeSpeaker, clearing: Clearing
 ):
     """BlueZ may recreate the device and cache a BR/EDR table again later."""
     client = SoundboksClient(bluez_device(), None)
@@ -194,7 +230,7 @@ async def test_stale_table_is_cleared_again_after_a_full_table(
     fake_speaker.hidden = {VOLUME_UUID}
     with pytest.raises(SpeakerUnreachableError):
         await client.read_state()
-    assert forget.await_count == 2
+    assert clearing.clear_cache.await_count == 2  # without waiting out the retry window
 
 
 async def test_bus_failure_is_reported_not_raised():
@@ -215,7 +251,6 @@ async def test_no_orphaned_link_left_alone(fake_speaker: FakeSpeaker):
         await client.set_volume(10)  # our own link is never an orphan
         assert await client.close_orphaned_link() is False
     close.assert_awaited_once()  # only the clean-up before connecting
-    await client.disconnect()
 
 
 async def test_stale_links_closed_before_each_connection(fake_speaker: FakeSpeaker):

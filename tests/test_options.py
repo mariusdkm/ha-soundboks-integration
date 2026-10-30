@@ -1,4 +1,4 @@
-"""The options: a turn-on action and a battery sensor, both optional."""
+"""The options: a power switch, a turn-on action and a battery sensor, all optional."""
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
@@ -13,7 +13,7 @@ from custom_components.soundboks.const import (
     CONF_TURN_ON_ENTITY,
 )
 
-from .conftest import FakeSpeaker, advertise, make_entry, setup_entry
+from .conftest import FakeSpeaker, make_entry, setup_entry, setup_present
 
 pytestmark = pytest.mark.usefixtures("enable_bluetooth")
 
@@ -28,47 +28,36 @@ async def configure(hass: HomeAssistant, entry: MockConfigEntry, user_input: dic
     return result
 
 
-async def test_options_set_both(
-    hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
+ALL_OPTIONS = {
+    CONF_POWER_SWITCH: "switch.speaker_plug",
+    CONF_TURN_ON_ENTITY: "script.speaker_on",
+    CONF_BATTERY_ENTITY: "sensor.pack_battery",
+}
+
+
+@pytest.mark.parametrize(
+    ("before", "user_input"),
+    [
+        ({}, ALL_OPTIONS),
+        ({}, {CONF_POWER_SWITCH: "switch.speaker_plug"}),
+        (ALL_OPTIONS, {}),  # cleared
+    ],
+)
+async def test_options_saved(
+    hass: HomeAssistant, fake_speaker: FakeSpeaker, before: dict, user_input: dict
 ):
-    await setup_entry(hass, mock_entry)
-    result = await configure(
-        hass,
-        mock_entry,
-        {CONF_TURN_ON_ENTITY: "script.speaker_on", CONF_BATTERY_ENTITY: "sensor.pack_battery"},
-    )
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert mock_entry.options == {
-        CONF_TURN_ON_ENTITY: "script.speaker_on",
-        CONF_BATTERY_ENTITY: "sensor.pack_battery",
-    }
-
-
-async def test_options_cleared(hass: HomeAssistant, fake_speaker: FakeSpeaker):
-    entry = make_entry(
-        **{CONF_TURN_ON_ENTITY: "script.speaker_on", CONF_BATTERY_ENTITY: "sensor.pack_battery"}
-    )
+    entry = make_entry(**before)
     await setup_entry(hass, entry)
-    result = await configure(hass, entry, {})
+    result = await configure(hass, entry, user_input)
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert entry.options == {}
+    assert entry.options == user_input
 
 
 async def test_options_change_reloads_without_error(
     hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
 ):
-    await setup_entry(hass, mock_entry)
-    await advertise(hass, mock_entry)
+    await setup_present(hass, mock_entry)
     assert hass.states.get(MEDIA_PLAYER).state == STATE_ON
     await configure(hass, mock_entry, {CONF_TURN_ON_ENTITY: "script.speaker_on"})
     assert mock_entry.state is ConfigEntryState.LOADED
     assert hass.states.get(MEDIA_PLAYER).state == STATE_ON
-
-
-async def test_options_set_power_switch(
-    hass: HomeAssistant, mock_entry: MockConfigEntry, fake_speaker: FakeSpeaker
-):
-    await setup_entry(hass, mock_entry)
-    result = await configure(hass, mock_entry, {CONF_POWER_SWITCH: "switch.speaker_plug"})
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert mock_entry.options == {CONF_POWER_SWITCH: "switch.speaker_plug"}

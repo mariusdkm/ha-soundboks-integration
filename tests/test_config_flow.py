@@ -219,10 +219,10 @@ async def test_unsupported_speaker_reported_on_retry_after_clearing_its_table(
             "custom_components.soundboks.config_flow.async_ble_device_from_address",
             return_value=device,
         ),
+        patch("custom_components.soundboks.client.removable", AsyncMock(return_value=True)),
         patch(
-            "custom_components.soundboks.client.forget_device", AsyncMock(return_value=True)
-        ) as forget,
-        patch("custom_components.soundboks.client.clear_cache", AsyncMock()),
+            "custom_components.soundboks.client.clear_cache", AsyncMock(return_value=True)
+        ) as clear,
         patch("custom_components.soundboks.client.prefer_le", AsyncMock()),
     ):
         result = await start_bluetooth(hass)
@@ -230,4 +230,4 @@ async def test_unsupported_speaker_reported_on_retry_after_clearing_its_table(
         result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "not_supported"
-    forget.assert_awaited_once()
+    clear.assert_awaited_once()

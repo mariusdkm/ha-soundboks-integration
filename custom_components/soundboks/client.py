@@ -8,6 +8,7 @@ the link closes it straight away. One lock runs every operation in turn.
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from time import monotonic
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
@@ -20,7 +21,7 @@ from bleak_retry_connector import (
     get_connected_devices,
 )
 
-from .bluez import bluez_path, forget_device, prefer_le
+from .bluez import bluez_path, forget_device, prefer_le, removable
 from .protocol import (
     AUTO_BOOT_ONCE,
     FIRMWARE_UUID,
@@ -75,6 +76,8 @@ AUTO_BOOT_WAIT = 3.0
 REBOOT_ATTEMPTS = 5
 REBOOT_RETRY_DELAY = 3.0
 LINK_ERRORS = (BleakError, TimeoutError)
+# A table read while the speaker boots can be partial too: clearing it is retried this often
+STALE_TABLE_RETRY = 60.0
 
 
 class SoundboksClient:
@@ -100,8 +103,8 @@ class SoundboksClient:
         self._idle_task: asyncio.Task | None = None
         # The serial channel's UUIDs as this speaker declares them, found at each connection
         self._serial_tx: str | None = None
-        # BlueZ's stale GATT table is cleared once; missing characteristics after that are real
-        self._stale_table_cleared = False
+        # When a bad GATT table was last cleared; missing characteristics soon after are real
+        self._stale_table_cleared_at: float | None = None
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """The latest device seen advertising, used for the next connection."""
@@ -330,11 +333,13 @@ class SoundboksClient:
         self._client = client
         self._authenticated = False
         self._responses = asyncio.Queue()
-        if not self._missing_required(client):
-            # A stale table that comes back later (BlueZ recreated the device) is cleared again
-            self._stale_table_cleared = False
-        elif await self._clear_stale_table():
-            raise SpeakerUnreachableError(UNREACHABLE_MESSAGE)
+        if missing := self._missing_required(client):
+            _LOGGER.debug("%s's GATT table lacks %s", self._ble_device.address, missing)
+            if await self._clear_stale_table():
+                raise SpeakerUnreachableError(UNREACHABLE_MESSAGE)
+        else:
+            # A bad table that comes back later (BlueZ recreated the device) is cleared at once
+            self._stale_table_cleared_at = None
         self._serial_tx = _first_present(client, SERIAL_TX_UUIDS)
         # Keep this subscription for the link's lifetime: unsubscribing drops the authentication
         if serial_rx := _first_present(client, SERIAL_RX_UUIDS):
@@ -350,28 +355,39 @@ class SoundboksClient:
         return client
 
     @staticmethod
-    def _missing_required(client: BleakClient) -> bool:
-        return any(client.services.get_characteristic(uuid) is None for uuid in REQUIRED_UUIDS)
+    def _missing_required(client: BleakClient) -> list[str]:
+        return [uuid for uuid in REQUIRED_UUIDS if client.services.get_characteristic(uuid) is None]
 
     async def _clear_stale_table(self) -> bool:
-        """Forget the speaker in BlueZ once, in case its GATT table is a BR/EDR leftover.
+        """Forget the speaker in BlueZ, in case its GATT table is bad; at most once a while.
 
-        True when it tried: the link is dropped either way, and the next connection starts over.
-        Only for a speaker behind a local BlueZ adapter; elsewhere the table is what it is.
+        A table can be a BR/EDR leftover, or partial because it was read while the speaker
+        booted. True when it cleared it: the link is dropped, and the next connection reads the
+        table afresh. Only for an unpaired speaker behind a local BlueZ adapter; elsewhere the
+        table is what it is.
         """
         device = self._ble_device
-        if self._stale_table_cleared or device is None or bluez_path(device) is None:
+        if device is None or bluez_path(device) is None:
             return False
-        self._stale_table_cleared = True
+        now = monotonic()
+        last = self._stale_table_cleared_at
+        if last is not None and now - last < STALE_TABLE_RETRY:
+            return False
+        self._stale_table_cleared_at = now
+        # Checked first: clearing bleak-retry-connector's copy removes the device from BlueZ
+        # without looking, and removing a paired device deletes its pairing
+        if not await removable(device):
+            _LOGGER.debug("Not clearing %s's GATT table: paired, or unknown", device.address)
+            return False
         await self._drop()
-        # bleak-retry-connector keeps its own copy of the table, which would outlive BlueZ's
-        await clear_cache(device.address)
-        if await forget_device(device):
-            _LOGGER.warning(
-                "%s lacked its control characteristics, likely a table cached from a classic "
-                "Bluetooth connection; cleared it, the next connection reads it again",
-                device.address,
-            )
+        if not await clear_cache(device.address):
+            # bleak-retry-connector had no copy, so nothing removed BlueZ's yet
+            await forget_device(device)
+        _LOGGER.warning(
+            "%s lacked its control characteristics: a table cached from a classic Bluetooth "
+            "connection, or read while it started. Cleared it, the next connection reads it again",
+            device.address,
+        )
         return True
 
     async def _ensure_authenticated(self, client: BleakClient) -> None:

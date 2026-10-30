@@ -1,24 +1,28 @@
 """Shared fixtures: a fake speaker standing in for the BLE stack."""
 
 import asyncio
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.components.bluetooth import (
     MONOTONIC_TIME,
     BluetoothServiceInfoBleak,
     async_clear_advertisement_history,
     async_get_advertisement_callback,
 )
-from homeassistant.const import CONF_ADDRESS
+from homeassistant.components.media_player import DOMAIN as MP_DOMAIN
+from homeassistant.const import ATTR_ENTITY_ID, CONF_ADDRESS
 from homeassistant.core import HomeAssistant
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
-from custom_components.soundboks.const import DOMAIN
+from custom_components.soundboks.const import CONF_PIN, DOMAIN
+from custom_components.soundboks.coordinator import SoundboksCoordinator
 from custom_components.soundboks.protocol import (
     ADVERTISED_SERVICE_UUID,
     AUTO_BOOT_ONCE,
@@ -35,6 +39,7 @@ from custom_components.soundboks.protocol import (
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
 NAME = "#202047"
+PLAYER = "media_player.soundboks_202047"
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +94,7 @@ class FakeSpeaker:
     connect_count: int = 0
     failing_connects: int = 0
     client: FakeBleakClient | None = None
+    clients: list[FakeBleakClient] = field(default_factory=list)
 
     def set_pin(self, pin: str) -> None:
         self.pin = pin
@@ -152,7 +158,7 @@ class FakeBleakClient:
         if uuid == POWER_UUID:
             self.speaker.failing_connects = self.speaker.failing_connects_after_power_write
         if uuid == POWER_UUID and self.speaker.drop_on_power_write:
-            await self._drop()
+            self.drop()
             raise BleakError("disconnected")
         self.speaker.values[uuid] = data
 
@@ -161,9 +167,9 @@ class FakeBleakClient:
         self.callbacks[uuid] = callback
 
     async def disconnect(self) -> None:
-        await self._drop()
+        self.drop()
 
-    async def _drop(self) -> None:
+    def drop(self) -> None:
         if self.is_connected:
             self.is_connected = False
             if self._disconnected_callback:
@@ -182,10 +188,13 @@ def fake_speaker() -> Iterator[FakeSpeaker]:
             raise BleakError("device not found")
         speaker.connect_count += 1
         speaker.client = FakeBleakClient(speaker, disconnected_callback)
+        speaker.clients.append(speaker.client)
         return speaker.client
 
     with patch("custom_components.soundboks.client.establish_connection", establish_connection):
         yield speaker
+    for client in speaker.clients:
+        client.drop()  # links left open end, and with them the clients' idle timers
 
 
 def make_service_info(
@@ -213,12 +222,12 @@ def mock_entry() -> MockConfigEntry:
     return make_entry()
 
 
-def make_entry(**options: str) -> MockConfigEntry:
+def make_entry(pin: str | None = None, **options: str) -> MockConfigEntry:
     return MockConfigEntry(
         domain=DOMAIN,
         unique_id=ADDRESS,
         title=f"SOUNDBOKS {NAME}",
-        data={CONF_ADDRESS: ADDRESS},
+        data={CONF_ADDRESS: ADDRESS} | ({CONF_PIN: pin} if pin else {}),
         options=options,
     )
 
@@ -249,3 +258,44 @@ def go_unavailable(hass: HomeAssistant, entry: MockConfigEntry) -> None:
     """HA stopped hearing the speaker: it drops the history first, then calls back."""
     async_clear_advertisement_history(hass, ADDRESS)
     entry.runtime_data.async_handle_unavailable(make_service_info())
+
+
+async def setup_present(
+    hass: HomeAssistant, entry: MockConfigEntry, manufacturer_data: dict[int, bytes] | None = None
+) -> SoundboksCoordinator:
+    """Set up with the speaker on and advertising."""
+    await setup_entry(hass, entry)
+    await advertise(hass, entry, manufacturer_data)
+    return entry.runtime_data
+
+
+@pytest.fixture
+async def coordinator(
+    request: pytest.FixtureRequest,
+    hass: HomeAssistant,
+    mock_entry: MockConfigEntry,
+    fake_speaker: FakeSpeaker,
+) -> AsyncIterator[SoundboksCoordinator]:
+    """The default entry, set up with the speaker on; for tests that change nothing first."""
+    if "freezer" in request.fixturenames:
+        request.getfixturevalue("freezer")  # freeze first: adverts from before it look stale
+    yield await setup_present(hass, mock_entry)
+
+
+async def tick(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, delta: timedelta | float
+) -> None:
+    """Let time pass (a timedelta, or seconds), running what was scheduled for it."""
+    freezer.tick(delta if isinstance(delta, timedelta) else timedelta(seconds=delta))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+
+async def call_player(hass: HomeAssistant, service: str, **data) -> None:
+    await hass.services.async_call(
+        MP_DOMAIN, service, {ATTR_ENTITY_ID: PLAYER, **data}, blocking=True
+    )
+
+
+def power_writes(speaker: FakeSpeaker) -> list[bytes]:
+    return [data for uuid, data in speaker.writes if uuid == POWER_UUID]
