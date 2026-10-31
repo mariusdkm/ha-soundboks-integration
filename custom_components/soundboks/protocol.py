@@ -120,6 +120,9 @@ class SpeakerState:
     inputs: Input
     # The stored custom EQ in dB, lowest band first; it only sounds in the CUSTOM profile
     eq: tuple[int, ...] = FLAT_EQ
+    # What the serial command gla reports as the amount of stored log (unit unknown); None when
+    # it wasn't read. Tracked to find out whether a filling log precedes the speaker going silent
+    log_amount: int | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +197,21 @@ def _single_byte(data: bytes, what: str) -> int:
 
 def decode_volume(data: bytes) -> int:
     return _single_byte(data, "volume")
+
+
+MAX_LOG_AMOUNT_LENGTH = 4
+
+
+def decode_log_amount(data: bytes) -> int:
+    """The gla reply payload: an unsigned big-endian count (a Go on fw 2.4.3 sends one byte).
+
+    The byte order of a longer reply is a guess, so the caller logs the raw bytes too.
+    """
+    if not 1 <= len(data) <= MAX_LOG_AMOUNT_LENGTH:
+        raise ProtocolError(
+            f"log amount: expected 1-{MAX_LOG_AMOUNT_LENGTH} bytes, got {data.hex()}"
+        )
+    return int.from_bytes(data)
 
 
 def _check_profile(data: bytes) -> None:

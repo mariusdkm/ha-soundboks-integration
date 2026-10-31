@@ -12,10 +12,20 @@ CONF_BATTERY_ENTITY = "battery_entity"
 # Option: the switch powering the speaker (a smart plug in its charger's line). Off then arms
 # auto-boot and cuts the power; on restores it, and the speaker boots.
 CONF_POWER_SWITCH = "power_switch"
+# Options: seconds the link stays open after a command (0 = stay connected), seconds between polls
+CONF_IDLE_TIMEOUT = "idle_timeout"
+CONF_POLL_INTERVAL = "poll_interval"
 MANUFACTURER = "SOUNDBOKS ApS"
 
-POLL_INTERVAL = timedelta(seconds=30)
-IDLE_TIMEOUT = 30.0  # seconds a command keeps the link open
+# Polls only catch changes made outside HA (the knob, the app). Every poll is a connection, and
+# after ~500 of them in 4 h at 30 s the speaker went silent until power-cycled (2026-10-31), so
+# poll rarely. Any command or notification that updates the state restarts this interval.
+POLL_INTERVAL = timedelta(minutes=3)
+MIN_POLL_INTERVAL = timedelta(seconds=30)
+IDLE_TIMEOUT = 30.0  # seconds a command keeps the link open; the option's default
+MAX_IDLE_TIMEOUT = 3600.0
+# Staying connected: after the speaker dropped the link, connecting again is tried this soon
+RECONNECT_DELAY = timedelta(seconds=10)
 # The speaker stops advertising while any app is connected, so "not advertising" may only mean
 # busy: keep the last state this long before showing it off (see docs/PROTOCOL.md)
 PRESENCE_GRACE = timedelta(minutes=5)

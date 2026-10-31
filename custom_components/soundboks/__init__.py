@@ -12,19 +12,22 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 
 from .client import SoundboksClient
-from .const import CONF_PIN, DOMAIN, IDLE_TIMEOUT, PLATFORMS
+from .const import CONF_IDLE_TIMEOUT, CONF_PIN, DOMAIN, IDLE_TIMEOUT, PLATFORMS
 from .coordinator import SoundboksConfigEntry, SoundboksCoordinator, firmware_issue_id
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: SoundboksConfigEntry) -> bool:
     address = entry.data[CONF_ADDRESS]
+    idle_timeout = float(entry.options.get(CONF_IDLE_TIMEOUT, IDLE_TIMEOUT))
     client = SoundboksClient(
         # None while the speaker is off: the first advertisement provides it
         async_ble_device_from_address(hass, address, connectable=True),
         entry.data.get(CONF_PIN),
-        idle_timeout=IDLE_TIMEOUT,
+        # 0 in the options means stay connected
+        idle_timeout=idle_timeout or None,
         on_volume=lambda raw: coordinator.async_handle_volume(raw),
         on_inputs=lambda inputs: coordinator.async_handle_inputs(inputs),
+        on_link_lost=lambda: coordinator.async_handle_link_lost(),
     )
     coordinator = SoundboksCoordinator(hass, entry, client)
     entry.runtime_data = coordinator

@@ -18,6 +18,7 @@ One device per speaker, with:
 | Sound profile (select) | Power, Bass+ or Indoor. Shows "Custom" when a custom EQ was set from the app |
 | Stereo role (select) | Mono, Left or Right |
 | Active inputs (sensor) | What is playing right now, e.g. "AUX" or "Bluetooth". A change shows once it held for 3 seconds, which hides the speaker's in-between states while its amplifier winds down |
+| Log amount (sensor, diagnostic) | How much log the speaker has stored (its `gla` command; unit unknown), read at each poll. For tracking down speakers that stop answering after hours |
 | Reboot (button) | Restarts the speaker |
 | Battery (sensor) | Only when a battery sensor is set in [Options](#options): mirrors it |
 
@@ -69,9 +70,13 @@ the app, Home Assistant asks for the new one.
 
 ## Options
 
-Open the integration's **Configure** to set optional helpers. They're blank by default, and
-nothing changes until you set them.
+Open the integration's **Configure** to change how Home Assistant uses the Bluetooth link, and to
+set optional helpers. The helpers are blank by default, and nothing changes until you set them.
 
+- **Hang up after** (seconds, default 30): how long the link stays open after a command. **0 stays
+  connected**: see [How the connection is shared](#how-the-connection-is-shared).
+- **Poll every** (seconds, default 180, at least 30): how often the speaker is read, to catch
+  changes made outside Home Assistant (the knob, the app). Every command restarts this wait.
 - **Power switch**: a switch, typically a smart plug, between the speaker's charger and the wall,
   for a speaker that runs from its charger alone (no battery attached). Turning the speaker off
   then first tells it to start by itself when its power returns, and switches the power off;
@@ -95,14 +100,24 @@ nothing changes until you set them.
 ## How the connection is shared
 
 The speaker takes **a single Bluetooth connection at a time**. While Home Assistant is connected,
-the SOUNDBOKS app can't connect, and the other way round. So Home Assistant never stays connected
-for long:
+the SOUNDBOKS app can't connect, and the other way round. By default Home Assistant never stays
+connected for long:
 
-- **Every 30 seconds** it connects, reads the state, and disconnects right away.
-- **After a command** (volume, profile…) it stays connected for 30 seconds, so a series of volume
-  changes doesn't reconnect each time. Knob turns show up instantly during that window, and at
-  the next poll otherwise.
+- **Every 3 minutes** ([Poll every](#options)) it connects, reads the state, and disconnects
+  right away. A command restarts this wait.
+- **After a command** (volume, profile…) it stays connected for 30 seconds
+  ([Hang up after](#options)), so a series of volume changes doesn't reconnect each time. Knob
+  turns show up instantly during that window, and at the next poll otherwise.
 - **Whether the speaker is on** comes from its Bluetooth advertisements, without connecting.
+
+Polls used to run every 30 seconds. After about 500 connections in 4 hours, a SOUNDBOKS Go
+stopped advertising and answering until it was turned off and on, while AUX kept playing.
+
+If you don't use the SOUNDBOKS app, set **Hang up after** to **0** to **stay connected**: Home
+Assistant then connects about once per power-on, knob turns always show up instantly, and polls
+read over the open link. If the link drops, it reconnects as soon as the speaker advertises
+again, and shows it off after 5 minutes otherwise. The app can't reach the speaker over Bluetooth
+LE meanwhile.
 
 The speaker stops advertising while any app is connected to it, so Home Assistant can't tell "off"
 from "busy with the app". It keeps showing the last state for 5 minutes before marking the speaker

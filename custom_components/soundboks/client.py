@@ -1,8 +1,10 @@
 """The BLE connection to one speaker.
 
-The speaker takes a single connection at a time, so the client never holds one for long: a command
-keeps the link for an idle window (a burst of volume changes reuses it), anything else that opened
-the link closes it straight away. One lock runs every operation in turn.
+The speaker takes a single connection at a time and stops advertising while it has one. By default
+the client never holds the link for long: a command keeps it for an idle window (a burst of volume
+changes reuses it), anything else that opened the link closes it straight away. With no idle
+timeout it keeps the link instead, for as long as the speaker does. One lock runs every operation
+in turn.
 """
 
 import asyncio
@@ -43,6 +45,7 @@ from .protocol import (
     ProtocolError,
     RebootIncompleteError,
     SerialReply,
+    SoundboksError,
     SoundProfile,
     SpeakerState,
     SpeakerUnreachableError,
@@ -53,6 +56,7 @@ from .protocol import (
     decode_eq,
     decode_firmware,
     decode_inputs,
+    decode_log_amount,
     decode_profile,
     decode_stereo,
     decode_volume,
@@ -68,6 +72,8 @@ UNREACHABLE_MESSAGE = (
 )
 CONNECT_ATTEMPTS = 2  # fail fast: the next poll retries anyway
 RESPONSE_TIMEOUT = 5.0
+# Serial command reading the amount of stored log, sampled with every poll
+LOG_AMOUNT_OPCODE = "gla"
 # The speaker never answers the auto-boot write, so the client waits this long for it to reach
 # the speaker, then moves on (see AUTO_BOOT_ONCE)
 AUTO_BOOT_WAIT = 3.0
@@ -86,15 +92,19 @@ class SoundboksClient:
         ble_device: BLEDevice | None,
         pin: str | None,
         *,
-        idle_timeout: float = 30.0,
+        idle_timeout: float | None = 30.0,
         on_volume: Callable[[int], None] | None = None,
         on_inputs: Callable[[Input], None] | None = None,
+        on_link_lost: Callable[[], None] | None = None,
     ) -> None:
         self._ble_device = ble_device
         self._pin = pin
+        # None: never hang up, keep every link until the speaker drops it
         self._idle_timeout = idle_timeout
         self._on_volume = on_volume
         self._on_inputs = on_inputs
+        # Called when a link drops by itself (not when the client closes it)
+        self._on_link_lost = on_link_lost
         self._lock = asyncio.Lock()
         self._client: BleakClient | None = None
         self._authenticated = False
@@ -109,6 +119,10 @@ class SoundboksClient:
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """The latest device seen advertising, used for the next connection."""
         self._ble_device = ble_device
+
+    @property
+    def keeps_link(self) -> bool:
+        return self._idle_timeout is None
 
     @property
     def is_connected(self) -> bool:
@@ -172,9 +186,26 @@ class SoundboksClient:
                 stereo=decode_stereo(await self._read(client, STEREO_UUID)),
                 inputs=decode_inputs(await self._read(client, INPUTS_UUID)),
                 eq=decode_eq(profile),
+                log_amount=await self._read_log_amount(client),
             )
 
         return await self._run(read, command=False)
+
+    async def _read_log_amount(self, client: BleakClient) -> int | None:
+        """Best effort, on the poll's own link: a failure here must not cost the state read.
+
+        A dropped link still raises, failing the poll like any other read would.
+        """
+        if self._serial_tx is None:
+            return None
+        try:
+            raw = await self._serial_request(client, LOG_AMOUNT_OPCODE)
+            amount = decode_log_amount(raw)
+        except (TimeoutError, SoundboksError) as err:
+            _LOGGER.debug("Could not read the log amount: %s", str(err) or "timed out")
+            return None
+        _LOGGER.debug("Log amount %d (raw %s)", amount, raw.hex())
+        return amount
 
     async def set_volume(self, raw: int) -> None:
         if not 0 <= raw <= MAX_RAW_VOLUME:
@@ -288,7 +319,8 @@ class SoundboksClient:
         """Run operation on the link, connecting first if needed.
 
         A command (re)starts the idle window. Anything else closes a link it opened, and leaves
-        the idle window of an existing one alone, so polls never keep the speaker busy.
+        the idle window of an existing one alone, so polls never keep the speaker busy. Without
+        an idle timeout every link stays open.
         """
         async with self._lock:
             opened = not self.is_connected
@@ -307,7 +339,7 @@ class SoundboksClient:
                 raise
             if command and self.is_connected:
                 self._arm_idle()
-            elif opened:
+            elif opened and not self.keeps_link:
                 await self._drop()
             return result
 
@@ -453,9 +485,14 @@ class SoundboksClient:
         if client is self._client:
             self._client = None
             self._cancel_idle()
+            _LOGGER.debug("The link to the speaker dropped")
+            if self._on_link_lost is not None:
+                self._on_link_lost()
 
     def _arm_idle(self) -> None:
         self._cancel_idle()
+        if self._idle_timeout is None:
+            return  # the link stays
         loop = asyncio.get_running_loop()
         self._idle_handle = loop.call_later(self._idle_timeout, self._idle_expired)
 

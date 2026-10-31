@@ -80,7 +80,10 @@ class FakeSpeaker:
     # Like the real speaker: the auto-boot write is never answered, and the link stays up
     hang_on_auto_boot: bool = False
     # Serial command -> the RX notifications answering it
-    serial_replies: dict[bytes, list[bytes]] = field(default_factory=dict)
+    # By default only gla answers, as a Go on fw 2.4.3 did after a boot: 96 entries
+    serial_replies: dict[bytes, list[bytes]] = field(
+        default_factory=lambda: {b"gla": [b"\x01\x00\x00\x00\x01\x60"]}
+    )
     failing_reads: set[str] = field(default_factory=set)
     # Writes refused with a GATT error, the link staying up
     failing_writes: set[str] = field(default_factory=set)

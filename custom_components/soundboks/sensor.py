@@ -1,7 +1,7 @@
-"""Which inputs are playing, and the battery level when a battery sensor is configured."""
+"""Which inputs are playing, the stored log amount, and the battery level when configured."""
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
-from homeassistant.const import PERCENTAGE
+from homeassistant.const import PERCENTAGE, EntityCategory
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
@@ -16,7 +16,10 @@ async def async_setup_entry(
     entry: SoundboksConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    entities: list[SensorEntity] = [ActiveInputsSensor(entry.runtime_data)]
+    entities: list[SensorEntity] = [
+        ActiveInputsSensor(entry.runtime_data),
+        LogAmountSensor(entry.runtime_data),
+    ]
     if source := entry.options.get(CONF_BATTERY_ENTITY):
         entities.append(BatterySensor(entry.runtime_data, source))
     async_add_entities(entities)
@@ -34,6 +37,27 @@ class ActiveInputsSensor(SoundboksEntity, SensorEntity):
         if self.coordinator.data is None:
             return None
         return describe_inputs(self.coordinator.data.inputs) or "None"
+
+
+class LogAmountSensor(SoundboksEntity, SensorEntity):
+    """The speaker's stored log amount (gla), sampled with every poll; unit unknown.
+
+    Its history shows whether the log fills up before the speaker stops answering.
+    """
+
+    _attr_translation_key = "log_amount"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: SoundboksCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.address}_log_amount"
+
+    @property
+    def native_value(self) -> int | None:
+        if self.coordinator.data is None:
+            return None
+        return self.coordinator.data.log_amount
 
 
 class BatterySensor(SoundboksEntity, SensorEntity):

@@ -36,7 +36,10 @@ def make_client(pin: str | None = None, **kwargs) -> SoundboksClient:
 async def test_read_state_disconnects_when_it_opened_the_link(fake_speaker: FakeSpeaker):
     client = make_client()
     state = await client.read_state()
-    assert state == SpeakerState(0x2D, SoundProfile.POWER, StereoRole.MONO, Input.BLUETOOTH)
+    assert state == SpeakerState(
+        0x2D, SoundProfile.POWER, StereoRole.MONO, Input.BLUETOOTH, log_amount=0x60
+    )
+    assert fake_speaker.connect_count == 1  # gla rode on the poll's link
     assert client.is_connected is False
 
 

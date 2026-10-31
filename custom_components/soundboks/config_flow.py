@@ -17,15 +17,27 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import callback
-from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
+from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
 from .client import SoundboksClient
 from .const import (
     CONF_BATTERY_ENTITY,
+    CONF_IDLE_TIMEOUT,
     CONF_PIN,
+    CONF_POLL_INTERVAL,
     CONF_POWER_SWITCH,
     CONF_TURN_ON_ENTITY,
     DOMAIN,
+    IDLE_TIMEOUT,
+    MAX_IDLE_TIMEOUT,
+    MIN_POLL_INTERVAL,
+    POLL_INTERVAL,
 )
 from .protocol import (
     ADVERTISED_SERVICE_UUID,
@@ -237,9 +249,24 @@ class SoundboksConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
+MAX_POLL_INTERVAL = 3600
+
+
+def seconds_selector(minimum: float, maximum: float) -> NumberSelector:
+    return NumberSelector(
+        NumberSelectorConfig(
+            min=minimum,
+            max=maximum,
+            step=1,
+            mode=NumberSelectorMode.BOX,
+            unit_of_measurement="s",
+        )
+    )
+
+
 class SoundboksOptionsFlow(OptionsFlowWithReload):
-    """Optional helpers from outside the speaker: its power, something that turns it on, a
-    battery sensor."""
+    """How the link is used, and optional helpers from outside the speaker: its power, something
+    that turns it on, a battery sensor."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
@@ -248,6 +275,13 @@ class SoundboksOptionsFlow(OptionsFlowWithReload):
         # Optional with a suggested value, not a default: clearing a field removes the option
         schema = vol.Schema(
             {
+                vol.Required(
+                    CONF_IDLE_TIMEOUT, default=options.get(CONF_IDLE_TIMEOUT, IDLE_TIMEOUT)
+                ): seconds_selector(0, MAX_IDLE_TIMEOUT),
+                vol.Required(
+                    CONF_POLL_INTERVAL,
+                    default=options.get(CONF_POLL_INTERVAL, POLL_INTERVAL.total_seconds()),
+                ): seconds_selector(MIN_POLL_INTERVAL.total_seconds(), MAX_POLL_INTERVAL),
                 vol.Optional(
                     CONF_POWER_SWITCH,
                     description={"suggested_value": options.get(CONF_POWER_SWITCH)},

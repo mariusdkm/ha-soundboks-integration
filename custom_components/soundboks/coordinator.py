@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from datetime import timedelta
 
 from homeassistant.components.bluetooth import (
     MONOTONIC_TIME,
@@ -30,6 +31,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .client import SoundboksClient
 from .const import (
     COMMAND_BACKOFF,
+    CONF_POLL_INTERVAL,
     CONF_POWER_SWITCH,
     DOMAIN,
     FRESH_ADVERTISEMENT,
@@ -37,6 +39,7 @@ from .const import (
     POLL_INTERVAL,
     POWER_OFF_QUIET,
     PRESENCE_GRACE,
+    RECONNECT_DELAY,
 )
 from .protocol import (
     Advertisement,
@@ -70,8 +73,15 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
     def __init__(
         self, hass: HomeAssistant, entry: SoundboksConfigEntry, client: SoundboksClient
     ) -> None:
+        poll_interval = entry.options.get(CONF_POLL_INTERVAL)
         super().__init__(
-            hass, _LOGGER, config_entry=entry, name=entry.title, update_interval=POLL_INTERVAL
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=entry.title,
+            update_interval=POLL_INTERVAL
+            if poll_interval is None
+            else timedelta(seconds=float(poll_interval)),
         )
         self.client = client
         self.address: str = entry.data[CONF_ADDRESS]
@@ -80,6 +90,8 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
         # The latest model, firmware and security the speaker advertised, if it sends them
         self.advertisement: Advertisement | None = None
         self._cancel_grace: CALLBACK_TYPE | None = None
+        # Staying connected: the pending attempt to connect again after the link dropped
+        self._cancel_reconnect: CALLBACK_TYPE | None = None
         self._cancel_quiet: CALLBACK_TYPE | None = None
         # The volume unmuting restores: the last non-zero one seen, None until then
         self._unmute_volume: int | None = None
@@ -101,8 +113,10 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
         A speaker that stopped advertising is off or held by another app; connecting would only
         time out.
         """
-        if self.client.is_connected:
-            return True
+        return self.client.is_connected or self._advertising()
+
+    def _advertising(self) -> bool:
+        """The speaker advertised just now."""
         # HA's history, not our callback: callbacks only fire when an advertisement changes,
         # and the speaker repeats the same one
         last = async_last_service_info(self.hass, self.address, connectable=True)
@@ -136,12 +150,15 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
         except SpeakerUnreachableError:
             # Most likely another app holds the speaker: keep what we know
             _LOGGER.debug("Speaker %s unreachable, keeping last state", self.address)
+            self._link_gone()
             return self.data
         except ProtocolError as err:
             raise UpdateFailed(str(err)) from err
         if self.firmware is None:
             await self._async_read_firmware()
         self._unreachable_until = 0.0  # it answered: no need to hold commands back
+        if self.client.keeps_link:
+            self._cancel_grace_timer()  # it answered: it's here, advertising or not
         self._remember_volume(state.volume)
         return self._settle_inputs(state)
 
@@ -211,6 +228,8 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
 
     @callback
     def async_handle_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
+        if self.client.is_connected:
+            return  # it stopped advertising because we hold the link
         if not self.present or self._cancel_grace is not None:
             return
         if not PRESENCE_GRACE:
@@ -222,6 +241,41 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
     def _grace_expired(self, _now: object) -> None:
         self._cancel_grace = None
         self._mark_absent()
+
+    @callback
+    def async_handle_link_lost(self) -> None:
+        """The speaker dropped a link we keep: off, out of range, or a glitch.
+
+        HA saw no advertisements while we held the link, and won't report the speaker gone
+        again, so the grace starts here. Connecting again is tried until the grace runs out.
+        """
+        if not self.client.keeps_link:
+            return
+        self._link_gone()
+        if self._cancel_reconnect is None:
+            self._cancel_reconnect = async_call_later(self.hass, RECONNECT_DELAY, self._reconnect)
+
+    @callback
+    def _reconnect(self, _now: object) -> None:
+        """Connect again once the speaker advertises; a check, no radio traffic, until then."""
+        self._cancel_reconnect = None
+        if self.client.is_connected or not self.present:
+            return
+        if not self._advertising():
+            self._cancel_reconnect = async_call_later(self.hass, RECONNECT_DELAY, self._reconnect)
+            return
+        _LOGGER.debug("Speaker %s advertises again, reconnecting", self.address)
+        self.config_entry.async_create_background_task(
+            self.hass, self.async_request_refresh(), "soundboks reconnect"
+        )
+
+    @callback
+    def _link_gone(self) -> None:
+        """Staying connected, the link is gone: start the grace unless the speaker advertises."""
+        if not self.client.keeps_link or self.client.is_connected:
+            return
+        if self.present and self._cancel_grace is None and not self._advertising():
+            self._cancel_grace = async_call_later(self.hass, PRESENCE_GRACE, self._grace_expired)
 
     @callback
     def async_handle_volume(self, raw: int) -> None:
@@ -417,6 +471,7 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
             self._cancel_quiet = None
 
     async def async_shutdown(self) -> None:
+        self._cancel_reconnect_timer()
         self._cancel_settle_timer()
         self._cancel_quiet_timer()
         self._cancel_grace_timer()
@@ -440,6 +495,7 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
             ) from err
         except SpeakerUnreachableError as err:
             self._unreachable_until = MONOTONIC_TIME() + COMMAND_BACKOFF
+            self._link_gone()
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="unreachable"
             ) from err
@@ -456,6 +512,7 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
     @callback
     def _mark_absent(self) -> None:
         self._cancel_grace_timer()
+        self._cancel_reconnect_timer()
         self._cancel_settle_timer()
         if self.present:
             self.present = False
@@ -465,3 +522,8 @@ class SoundboksCoordinator(DataUpdateCoordinator[SpeakerState | None]):
         if self._cancel_grace is not None:
             self._cancel_grace()
             self._cancel_grace = None
+
+    def _cancel_reconnect_timer(self) -> None:
+        if self._cancel_reconnect is not None:
+            self._cancel_reconnect()
+            self._cancel_reconnect = None

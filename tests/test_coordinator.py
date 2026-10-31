@@ -19,7 +19,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.soundboks.const import DOMAIN, PRESENCE_GRACE
+from custom_components.soundboks.const import DOMAIN, POLL_INTERVAL, PRESENCE_GRACE
 from custom_components.soundboks.coordinator import SoundboksCoordinator
 from custom_components.soundboks.protocol import FIRMWARE_UUID, POWER_UUID, VOLUME_UUID
 
@@ -341,3 +341,26 @@ async def test_successful_poll_ends_the_hold_back(
     await coordinator.async_refresh()
     await coordinator.async_set_volume(20)
     assert (VOLUME_UUID, b"\x14") in fake_speaker.writes
+
+
+async def test_polls_every_three_minutes_and_a_command_restarts_the_wait(
+    hass: HomeAssistant,
+    mock_entry: MockConfigEntry,
+    coordinator: SoundboksCoordinator,
+    freezer: FrozenDateTimeFactory,
+):
+    """Polls only catch outside changes: a command just saw the speaker, so it delays the next."""
+    assert POLL_INTERVAL == timedelta(minutes=3)
+    polls = AsyncMock(return_value=coordinator.data)
+    with patch.object(coordinator, "_async_update_data", polls):
+        await tick(hass, freezer, timedelta(minutes=2, seconds=50))
+        assert polls.await_count == 0
+        await tick(hass, freezer, timedelta(seconds=15))
+        assert polls.await_count == 1  # 3 min after setup's poll
+        await tick(hass, freezer, timedelta(minutes=2))
+        await advertise(hass, mock_entry)
+        await coordinator.async_set_volume(10)
+        await tick(hass, freezer, timedelta(minutes=2))  # 4 min after the last poll
+        assert polls.await_count == 1
+        await tick(hass, freezer, timedelta(minutes=1, seconds=5))  # 3 min after the command
+        assert polls.await_count == 2

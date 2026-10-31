@@ -114,6 +114,9 @@
     "sensor": {
       "active_inputs": {
         "name": "Active inputs"
+      },
+      "log_amount": {
+        "name": "Log amount"
       }
     },
     "button": {
@@ -130,14 +133,18 @@
   "options": {
     "step": {
       "init": {
-        "title": "Extras",
-        "description": "Optional helpers for things the speaker can't do over Bluetooth.",
+        "title": "Options",
+        "description": "How Home Assistant uses the Bluetooth link, and optional helpers for things the speaker can't do over Bluetooth.",
         "data": {
+          "idle_timeout": "Hang up after",
+          "poll_interval": "Poll every",
           "power_switch": "Power switch",
           "turn_on_entity": "Turn-on action",
           "battery_entity": "Battery sensor"
         },
         "data_description": {
+          "idle_timeout": "How long the link stays open after a command; a poll hangs up at once. 0 stays connected: changes made with the knob show at once and the speaker is connected about once per power-on instead of once per poll, but while connected it stops advertising, so the SOUNDBOKS app and other phones can't reach it over Bluetooth LE.",
+          "poll_interval": "How often the speaker is read, to catch changes made outside Home Assistant (the knob, the app). Every command restarts this wait. While hung up, each poll is a new connection, and frequent connections have made the speaker stop answering until it was turned off and on.",
           "power_switch": "A switch (for example a smart plug) in the line of the speaker's charger, with the speaker running from it alone, no battery. Turning the speaker off then makes it start by itself when the power returns, and cuts the power; turning it on switches the power back on. If the power is cut some other way, or the speaker is turned off with its knob, only the knob turns it on again. Takes over from the turn-on action.",
           "turn_on_entity": "A script or button that turns the speaker on, for example one that triggers a device pressing its power button. The media player's power button then turns the speaker on.",
           "battery_entity": "A battery sensor for this speaker, measured some other way. It's shown on the speaker's device."

@@ -92,3 +92,26 @@ async def test_refused_auto_boot_write_is_an_error(fake_speaker: FakeSpeaker):
     fake_speaker.failing_writes = {POWER_UUID}
     with pytest.raises(SpeakerUnreachableError):
         await make_client().arm_auto_boot()
+
+
+@pytest.mark.parametrize(
+    ("replies", "has_serial"),
+    [
+        ({}, True),  # never answered
+        ({b"gla": [b"\x02\x06"]}, True),  # refused
+        ({b"gla": [b"\x01\x00\x00\x00\x00"]}, True),  # empty payload
+        ({b"gla": [b"\x07junk"]}, True),  # malformed
+        ({}, False),  # no serial channel: not even asked
+    ],
+)
+async def test_poll_survives_a_failed_log_amount(
+    fake_speaker: FakeSpeaker, monkeypatch, replies: dict[bytes, list[bytes]], has_serial: bool
+):
+    monkeypatch.setattr("custom_components.soundboks.client.RESPONSE_TIMEOUT", 0.01)
+    fake_speaker.serial_replies = replies
+    if not has_serial:
+        fake_speaker.serial = ("tx-missing", "rx-missing")
+    state = await make_client().read_state()
+    assert state.log_amount is None
+    assert state.volume == 0x2D
+    assert any(data == b"gla" for _uuid, data in fake_speaker.writes) is has_serial

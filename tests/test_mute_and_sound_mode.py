@@ -87,6 +87,7 @@ async def test_sound_mode_follows_profile(
 async def test_unknown_sound_mode_rejected(
     hass: HomeAssistant, coordinator: SoundboksCoordinator, fake_speaker: FakeSpeaker
 ):
+    fake_speaker.writes.clear()  # the setup poll's own serial read (gla)
     with pytest.raises(ServiceValidationError):
         await call_player(hass, SERVICE_SELECT_SOUND_MODE, **{ATTR_SOUND_MODE: "Loud"})
     assert fake_speaker.writes == []
